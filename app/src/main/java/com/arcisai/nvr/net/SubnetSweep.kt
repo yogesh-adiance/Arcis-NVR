@@ -37,6 +37,9 @@ object SubnetSweep {
         /** True if this camera serves ONVIF on the non-standard port 8888.
          *  When set, the IPCamInfo binding should use Port=8888 + Protocol=ONVIF. */
         val onvifPort8888: Boolean = false,
+        /** True if this camera answers ONVIF only over HTTPS (port 443) —
+         *  CP Plus consumer line, modern Hikvision firmware, etc. */
+        val onvifHttps443: Boolean = false,
     )
 
     /** Sweep the phone's current Wi-Fi /24 and return JSONObjects compatible
@@ -66,8 +69,9 @@ object SubnetSweep {
                                   probePort(ip, 8080, perHostTimeoutMs) ||
                                   probePort(ip, 88, perHostTimeoutMs)
                     val onvifAlt = probePort(ip, 8888, perHostTimeoutMs)
+                    val httpsStd = probePort(ip, 443, perHostTimeoutMs)
                     val dahuaP2P = probePort(ip, 37777, perHostTimeoutMs)
-                    if (rtsp || httpStd || onvifAlt || dahuaP2P) {
+                    if (rtsp || httpStd || onvifAlt || httpsStd || dahuaP2P) {
                         // Banner priority: 80 > 8080 > 8888 > none.
                         val banner = when {
                             probePort(ip, 80, 200)   -> httpBanner(ip, 80, perHostTimeoutMs)
@@ -75,7 +79,7 @@ object SubnetSweep {
                             probePort(ip, 8888, 200) -> httpBanner(ip, 8888, perHostTimeoutMs)
                             else -> ""
                         }
-                        Found(ip, rtsp, httpStd || onvifAlt || dahuaP2P, banner, onvifAlt)
+                        Found(ip, rtsp, httpStd || onvifAlt || dahuaP2P, banner, onvifAlt, httpsStd)
                     } else null
                 }
             }.awaitAll().filterNotNull()
@@ -107,25 +111,32 @@ object SubnetSweep {
                 f.rtsp -> "ONVIF"
                 else -> "ONVIF"
             }
-            // Port priority: if the camera serves ONVIF on 8888 (common for
-            // consumer HD_ONVIF_IPC cams), that's the right binding port —
-            // the NVR will SOAP it for stream URI + PTZ. Otherwise fall back
-            // to standard HTTP 80 or RTSP 554.
+            // Port priority: explicit ONVIF locations win, then standard HTTP/RTSP.
+            //   8888       : HD_ONVIF_IPC consumer cams (TrueView etc.)
+            //   443        : HTTPS-only ONVIF — CP Plus consumer line, modern Hik
+            //                firmware. The app's OnvifMedia auto-picks https://
+            //                when it sees port 443.
             val effectivePort = when {
-                f.onvifPort8888 -> 8888
-                f.http          -> 80
-                else            -> 554
+                f.onvifPort8888  -> 8888
+                f.onvifHttps443  -> 443
+                f.http           -> 80
+                else             -> 554
             }
-            // If we found it on 8888, the protocol must be ONVIF — the NVR
+            // If we found it on 8888 / 443, the protocol must be ONVIF — the NVR
             // dispatches to its ONVIF client only when Protocolname=ONVIF.
-            val effectiveProtocol = if (f.onvifPort8888 && fp.kind != "HIKVISION_ISAPI" &&
+            val effectiveProtocol = if ((f.onvifPort8888 || f.onvifHttps443) &&
+                                        fp.kind != "HIKVISION_ISAPI" &&
                                         fp.kind != "DAHUA_CGI") "ONVIF" else protocol
 
             JSONObject().apply {
                 put("IPAddr", f.ip)
                 put("Port", effectivePort)
                 put("Mac", "")
-                val onvifNote = if (f.onvifPort8888) "ONVIF:8888" else ""
+                val onvifNote = when {
+                    f.onvifPort8888 -> "ONVIF:8888"
+                    f.onvifHttps443 -> "ONVIF:HTTPS"
+                    else -> ""
+                }
                 val modelString = listOf(manufacturer, modelHint, fp.kind, onvifNote)
                     .filter { it.isNotBlank() }
                     .distinct()

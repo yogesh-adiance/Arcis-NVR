@@ -11,7 +11,9 @@ import com.arcisai.nvr.data.CredentialStore
 import com.arcisai.nvr.data.NvrCredentials
 import com.arcisai.nvr.net.NetSdkApi
 import com.arcisai.nvr.net.OnvifDiscovery
+import com.arcisai.nvr.net.OnvifMedia
 import com.arcisai.nvr.net.PtzClient
+import com.arcisai.nvr.net.RtspTlsProxy
 import com.arcisai.nvr.net.SubnetSweep
 import com.arcisai.nvr.p2p.RemoteConfig
 import com.arcisai.nvr.p2p.RemoteSession
@@ -180,6 +182,9 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         sessions.clear()
         httpTunnelSessions.values.forEach { runCatching { it.close() } }
         httpTunnelSessions.clear()
+        tlsProxies.values.forEach { runCatching { it.close() } }
+        tlsProxies.clear()
+        onvifStreamUrlCache.clear()
         store.clear()
         cache.clear()
         credentials = null
@@ -189,29 +194,146 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         remoteStatus = null
     }
 
+    // Per-channel TLS-strip proxies for cameras whose RTSP is TLS-only
+    // (rtsps://) — libVLC's Android build doesn't speak rtsps directly.
+    // Lazy-opened on first stream, kept until logout / channel rebind.
+    private val tlsProxies = ConcurrentHashMap<Int, RtspTlsProxy>()
+
     /**
      * RTSP URL the libVLC player should open for a given channel. Dispatches
      * on the channel's Protocolname (N1 / HIKVISION / DAHUA / ONVIF / RTSP) —
      * see [NetSdkApi.cameraRtspUrl] / [NetSdkApi.cameraRtspUrlTunneled].
      *
-     * Remote-mode keys per-channel libjuice sessions and points the URL at
-     * `127.0.0.1:<localPort>`. Sessions are torn down on every call so
-     * switching Sub↔Main starts a fresh RTSP CSeq (the camera replays stale
-     * responses if we reuse the tunnel).
+     * Three transforms applied in order:
+     *  1. Build the per-vendor URL from IPCamInfo (or honor RtspUrl override)
+     *  2. If Remote (P2P) mode → swap the host:port for a libjuice localhost tunnel
+     *  3. If the URL is `rtsps://` (RTSP-over-TLS) → spin up a [RtspTlsProxy]
+     *     and rewrite to plain `rtsp://127.0.0.1:<proxyPort>/...` so libVLC
+     *     (which doesn't support rtsps on Android) can play it. Verified live
+     *     against TrueView CP-E31Q family cams which only serve TLS RTSP.
      */
     suspend fun ensureChannelStreamUrl(channelId: Int, stream: Int = 1): String? {
         val creds = credentials ?: return null
         val entry = findIpCamEntry(channelId) ?: return null
-        if (!creds.remote) {
-            return NetSdkApi.cameraRtspUrl(entry, channelId, stream)
+
+        // For ONVIF cameras, the URL path varies per vendor (TrueView uses
+        // /ch0_0.264 over rtsps, Vivotek uses /live.sdp, Axis uses /axis-media/
+        // media.amp, etc.) — and the NVR's IPCamInfo schema doesn't have a
+        // place to store the camera's literal URL. So we ask the camera
+        // itself via ONVIF GetStreamUri (one SOAP call). Result is cached for
+        // the channel lifetime so the SOAP overhead happens once.
+        //
+        // P2P mode: the SOAP call is routed through the per-channel HTTP
+        // libjuice tunnel (NVR's tcpsvd 8540+N → camera:ONVIF-port), and the
+        // rtsps URL we get back is rewritten to point at the per-channel RTSP
+        // libjuice tunnel (NVR's tcpsvd 5540+N → camera:554). The downstream
+        // TLS proxy then handshakes through that pipe end-to-end with the
+        // camera, so libVLC sees plain rtsp://127.0.0.1:<proxyPort>/...
+        val protocol = entry.optString("Protocolname").uppercase()
+        if (protocol == "ONVIF") {
+            val cached = onvifStreamUrlCache[Pair(channelId, stream)]
+            val onvifUrl = cached ?: run {
+                val (soapHost, soapPort) = if (creds.remote) {
+                    val httpPort = ensureChannelHttpTunnel(channelId) ?: return@run null
+                    "127.0.0.1" to httpPort
+                } else {
+                    entry.optString("IPAddr") to
+                        entry.optInt("Port", 80).let { if (it == 0) 80 else it }
+                }
+                OnvifMedia.getStreamUri(
+                    host = soapHost,
+                    port = soapPort,
+                    user = entry.optString("Username", "admin"),
+                    pass = entry.optString("Password", ""),
+                    sub  = (stream == 1),  // 0=main, 1=sub matches our internal convention
+                )
+            }
+            if (onvifUrl != null) {
+                onvifStreamUrlCache[Pair(channelId, stream)] = onvifUrl
+                val routed = if (creds.remote) {
+                    val rtspPort = ensureChannelRtspTunnel(channelId) ?: return null
+                    rewriteUrlHost(onvifUrl, "127.0.0.1", rtspPort)
+                } else onvifUrl
+                return maybeWrapTls(routed, channelId)
+            }
+            android.util.Log.w("NvrViewModel", "ONVIF GetStreamUri failed for ch$channelId — falling back")
         }
+
+        val baseUrl: String = if (!creds.remote) {
+            NetSdkApi.cameraRtspUrl(entry, channelId, stream) ?: return null
+        } else {
+            val rtspPort = ensureChannelRtspTunnel(channelId) ?: return null
+            NetSdkApi.cameraRtspUrlTunneled(entry, channelId, rtspPort, stream)
+        }
+
+        return maybeWrapTls(baseUrl, channelId)
+    }
+
+    /** Open (or reuse) the per-channel RTSP libjuice tunnel. Returns its
+     *  localhost port. Only valid in Remote mode. Mirrors the HTTP-tunnel
+     *  helper so ONVIF + non-ONVIF code paths share one lifecycle. */
+    private suspend fun ensureChannelRtspTunnel(channelId: Int): Int? {
+        val creds = credentials ?: return null
+        if (!creds.remote) return null
         val sid = "${creds.deviceId}-c$channelId"
-        sessions.remove(sid)?.let { runCatching { it.close() } }
+        val existing = sessions[sid]
+        if (existing != null && existing.isAlive) return existing.localPort
+        existing?.let { runCatching { it.close() } }
+        sessions.remove(sid)
+
         val ns = RemoteSession(sid, remoteConfig)
         val ok = ns.connect()
         if (!ok) { ns.close(); return null }
         sessions[sid] = ns
-        return NetSdkApi.cameraRtspUrlTunneled(entry, channelId, ns.localPort, stream)
+        android.util.Log.i("NvrViewModel", "RTSP tunnel ready: $sid -> 127.0.0.1:${ns.localPort}")
+        return ns.localPort
+    }
+
+    /** Swap the host:port of an rtsp/rtsps URL while preserving scheme,
+     *  userinfo, path, and query. Used to point an ONVIF-returned camera
+     *  URL at the local libjuice tunnel. */
+    private fun rewriteUrlHost(url: String, newHost: String, newPort: Int): String {
+        val schemeEnd = url.indexOf("://").takeIf { it >= 0 } ?: return url
+        val authStart = schemeEnd + 3
+        val pathStart = url.indexOf('/', authStart).takeIf { it >= 0 } ?: url.length
+        val auth = url.substring(authStart, pathStart)
+        val at = auth.lastIndexOf('@')
+        val userinfo = if (at >= 0) auth.substring(0, at + 1) else ""
+        val tail = url.substring(pathStart)
+        return "${url.substring(0, authStart)}${userinfo}${newHost}:${newPort}${tail}"
+    }
+
+    // Cache of camera-direct ONVIF GetStreamUri results, keyed by
+    // (channelId, stream). Avoids re-querying the camera on every UI nav.
+    private val onvifStreamUrlCache = ConcurrentHashMap<Pair<Int, Int>, String>()
+
+    /** If the URL is `rtsps://`, ensure a per-channel TLS-strip proxy is
+     *  running and rewrite to `rtsp://127.0.0.1:<port>/...`. libVLC's
+     *  Android build doesn't speak rtsps — verified live, "only real/helix
+     *  rtsp servers supported for now" error.
+     *
+     *  Reuse rule: only reuse the cached proxy if it still targets the same
+     *  upstream host:port. In P2P mode the libjuice tunnel may have been
+     *  rebuilt on a different localhost port between stream opens — reusing
+     *  the old proxy would dial a dead port and the stream would silently
+     *  fail on the 2nd open even though the 1st worked. */
+    private fun maybeWrapTls(url: String, channelId: Int): String {
+        if (!url.startsWith("rtsps://", ignoreCase = true)) return url
+        val hp = RtspTlsProxy.parseCameraHostPort(url) ?: return url
+        val existing = tlsProxies[channelId]
+        val proxy = if (existing != null && existing.localPort > 0 &&
+                        existing.cameraHost == hp.first && existing.cameraPort == hp.second) {
+            existing
+        } else {
+            existing?.let { runCatching { it.close() } }
+            RtspTlsProxy(hp.first, hp.second).also {
+                it.start()
+                tlsProxies[channelId] = it
+            }
+        }
+        val rewritten = RtspTlsProxy.rewriteUrl(url, proxy.localPort)
+        android.util.Log.i("NvrViewModel", "rtsps wrap ch$channelId: $url -> $rewritten (proxy target ${proxy.cameraHost}:${proxy.cameraPort})")
+        return rewritten
     }
 
     // Total channel slots reported by the NVR. Default 4 (this firmware's MAX_CHN);

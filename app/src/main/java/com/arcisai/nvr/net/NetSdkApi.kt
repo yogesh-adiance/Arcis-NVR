@@ -193,27 +193,32 @@ class NetSdkApi(val creds: NvrCredentials) {
             val ip = ipCamEntry.optString("IPAddr").ifBlank { return null }
             val username = ipCamEntry.optString("Username", "admin")
             val password = ipCamEntry.optString("Password", "")
-            val port = ipCamEntry.optInt("Port", 554).let { if (it == 80 || it == 0) 554 else it }
             val protocol = ipCamEntry.optString("Protocolname", "N1").uppercase()
-            // Always emit `user:pass@`, even when password is empty — RTSP URI
-            // grammar requires the colon for the "user (blank pass)" case.
-            // Dropping it changes the URI semantics and most RTSP servers
-            // reject the result with 401. Verified live against AD-90: with-colon
-            // streams, no-colon returns 401.
+            // Always emit `user:pass@` — RTSP URI grammar requires the colon
+            // even when password is empty (verified live against AD-90).
             val userInfo = "$username:$password"
+            // IMPORTANT: IPCamInfo.Port stores the camera's CONTROL port
+            // (HTTP / ONVIF SOAP), NOT the RTSP port. RTSP is on its own
+            // well-known port — virtually always 554 across every vendor.
+            // Previous bug: we passed Port=8888 (ONVIF) into the RTSP URL
+            // → VLC stuck on "Connecting…" (no RTSP listener on 8888).
+            val rtspPort = 554
 
             return when (protocol) {
-                "HIKVISION" -> rtspHik(userInfo, ip, port, channelId, stream)
-                "DAHUA"     -> rtspDahua(userInfo, ip, port, channelId, stream)
+                "HIKVISION" -> rtspHik(userInfo, ip, rtspPort, channelId, stream)
+                "DAHUA"     -> rtspDahua(userInfo, ip, rtspPort, channelId, stream)
                 "RTSP"      -> ipCamEntry.optString("RtspUrl").ifBlank {
-                    rtspHik(userInfo, ip, port, channelId, stream)
+                    rtspHik(userInfo, ip, rtspPort, channelId, stream)
                 }
                 "ONVIF" -> {
                     val custom = ipCamEntry.optString("RtspUrl")
                     if (custom.isNotBlank()) custom
-                    else rtspHik(userInfo, ip, port, channelId, stream)
+                    // Profile_1 is the most common ONVIF stream alias.
+                    // TODO: replace with a real ONVIF GetStreamUri SOAP call
+                    //       once the user provides a working camera password.
+                    else "rtsp://$userInfo@$ip:$rtspPort/Profile_1"
                 }
-                else -> "rtsp://$userInfo@$ip:$port/ch0_$stream.264"  // N1 / HICHIP / fallback
+                else -> "rtsp://$userInfo@$ip:$rtspPort/ch0_$stream.264"  // N1 / HICHIP / fallback
             }
         }
 
