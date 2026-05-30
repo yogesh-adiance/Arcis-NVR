@@ -1,0 +1,202 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="ie=edge">
+  <link rel="icon" href="./favicon.ico" type="image/x-icon" />
+  <link rel="stylesheet" href="./dist/style.css">
+  <title></title>
+</head>
+
+<body>
+  <div id="app"></div>
+  <script type="text/javascript" src="view1.js"></script>
+  <script src="./dist/build.js"></script>
+  <script src="./dist/import.js"></script>
+  <script src="./main.js"></script>
+  <!-- <script type="text/javascript" src="xml.js"></script> -->
+  <script type="text/javascript" src="swfobject.js"></script>
+  <script>
+  </script>
+  <!-- BEGIN nvr-cloud-platform overlay (non-destructive): only activates when
+       the user is on the Preview tab. All other vendor tabs (Playback,
+       Settings, Management, etc.) show the original SPA untouched. -->
+  <script>
+  (function () {
+    var IFRAME_ID = 'cp-live-iframe';
+    var TAB_NAMES = ['preview', 'Preview', 'é¢è§', 'Live', 'live'];
+    var visible = false;
+
+    function liveUrl() {
+      return location.protocol + '//' + location.hostname + ':8080/live.html';
+    }
+
+    function ensureIframe() {
+      var f = document.getElementById(IFRAME_ID);
+      if (f) return f;
+      f = document.createElement('iframe');
+      f.id = IFRAME_ID;
+      f.allow = 'autoplay';
+      f.allowFullscreen = true;
+      // top edge measured dynamically from the tab bar's bottom; updated
+      // on every resize / tab-change tick so the iframe seam never
+      // shows a strip of vendor content.
+      f.style.cssText = [
+        'position:fixed',
+        'left:0',
+        'right:0',
+        'bottom:0',
+        'width:100%',
+        'border:0',
+        'z-index:9999',
+        'background:#000',
+        'display:none',
+      ].join(';');
+      f.src = liveUrl();
+      document.body.appendChild(f);
+      return f;
+    }
+
+    // Compute the bottom edge (in px from viewport top) of the
+    // currently-active vendor tab bar by walking the DOM for elements
+    // whose text matches a tab name and which have an active-style
+    // class. Returns the maximum bottom Y so the iframe sits flush
+    // against whatever's the lowest "navigation strip".
+    function tabBarBottom() {
+      var sel = document.querySelectorAll(
+        '.active, .selected, .is-active, .current, [class*="active"]'
+      );
+      var bottom = 0;
+      for (var i = 0; i < sel.length; i++) {
+        var el = sel[i];
+        var t = (el.textContent || '').trim();
+        if (t.length > 80) continue;
+        var hit = false;
+        for (var k = 0; k < TAB_NAMES.length; k++) {
+          if (t === TAB_NAMES[k]) { hit = true; break; }
+        }
+        if (!hit) continue;
+        // Walk up to the nearest container with a meaningful height â
+        // usually 2-3 levels above the tab text. Pick the closest
+        // ancestor whose width is the full viewport (= the nav row).
+        var anc = el;
+        for (var depth = 0; depth < 6 && anc; depth++) {
+          var r = anc.getBoundingClientRect();
+          if (r.width >= window.innerWidth * 0.9 && r.height > 0) {
+            bottom = Math.max(bottom, r.bottom);
+            break;
+          }
+          anc = anc.parentElement;
+        }
+      }
+      // Fallback: 60 px (the historical guess) if nothing measured.
+      return bottom > 0 ? Math.round(bottom) : 60;
+    }
+
+    function applyIframeTop() {
+      var f = document.getElementById(IFRAME_ID);
+      if (!f) return;
+      var top = tabBarBottom();
+      f.style.top = top + 'px';
+      f.style.height = 'calc(100vh - ' + top + 'px)';
+    }
+
+    function show() {
+      if (visible) return;
+      visible = true;
+      ensureIframe().style.display = 'block';
+      applyIframeTop();
+    }
+
+    function hide() {
+      if (!visible) return;
+      visible = false;
+      var f = document.getElementById(IFRAME_ID);
+      if (f) f.style.display = 'none';
+    }
+
+    function isPreviewTabName(s) {
+      if (!s) return false;
+      s = s.trim();
+      if (!s) return false;
+      for (var i = 0; i < TAB_NAMES.length; i++) {
+        if (s === TAB_NAMES[i]) return true;
+      }
+      return false;
+    }
+
+    // Detect "is the Preview tab currently active?" by walking the DOM
+    // for an element with an active/selected class whose text matches
+    // one of TAB_NAMES. The vendor's SPA uses Vue-style class binding;
+    // common active classnames: active, selected, is-active, current.
+    function isPreviewActive() {
+      var sel = document.querySelectorAll(
+        '.active, .selected, .is-active, .current, [class*="active"]'
+      );
+      for (var i = 0; i < sel.length; i++) {
+        var t = (sel[i].textContent || '').trim();
+        // Tabs are short labels; reject long blocks of text to avoid
+        // false positives from active page-content elements.
+        if (t.length > 40) continue;
+        // Some elements wrap the label inside a child; descend.
+        if (isPreviewTabName(t)) return true;
+        // Also check direct child labels.
+        var labels = sel[i].querySelectorAll('a, span, button, div');
+        for (var j = 0; j < labels.length; j++) {
+          var lt = (labels[j].textContent || '').trim();
+          if (lt.length > 40) continue;
+          if (isPreviewTabName(lt)) return true;
+        }
+      }
+      return false;
+    }
+
+    function evaluate() {
+      if (isPreviewActive()) show();
+      else hide();
+    }
+
+    // Hook tab clicks: any click on an element whose text is exactly a
+    // tab name fires evaluate() shortly after to give the SPA time to
+    // update the active class.
+    document.addEventListener('click', function (e) {
+      var el = e.target;
+      // Walk up a few levels in case the click was on an inner span.
+      for (var i = 0; i < 4 && el; i++) {
+        var t = (el.textContent || '').trim();
+        if (isPreviewTabName(t)) {
+          // Wait for the SPA to render the new tab's active state.
+          setTimeout(evaluate, 50);
+          setTimeout(evaluate, 300);
+          return;
+        }
+        el = el.parentElement;
+      }
+      // Click on something else: re-evaluate after a tick in case the
+      // SPA's own click handler changed the active tab.
+      setTimeout(evaluate, 100);
+    }, true);
+
+    // Initial poll: vendor SPA renders asynchronously after page load,
+    // so evaluate a few times.
+    var pollTicks = 0;
+    var poll = setInterval(function () {
+      evaluate();
+      if (++pollTicks > 30) clearInterval(poll); // 15 s
+    }, 500);
+    window.addEventListener('hashchange', evaluate);
+    window.addEventListener('DOMContentLoaded', evaluate);
+    // Vendor tab-bar may animate/transition; recompute iframe top
+    // periodically while visible so the seam stays flush. Also on
+    // window resize.
+    window.addEventListener('resize', applyIframeTop);
+    setInterval(function () { if (visible) applyIframeTop(); }, 500);
+  }());
+  </script>
+  <!-- END nvr-cloud-platform overlay -->
+</body>
+
+</html>
+

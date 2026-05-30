@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+      Cameras + NVRs on customer LANs all speak plain HTTP on whatever IP the
+      router assigned them today. We can't predict those IPs at build time, and
+      Android's <domain> element only matches exact hostnames (no CIDR / no
+      subnets), so the previous explicit allow-list silently dropped every
+      camera IP not listed. Switched to permitting cleartext globally —
+      this is an admin-tool app for LAN cameras, all traffic is necessarily
+      plain HTTP, and HTTPS isn't an option these devices offer.
+      Verified bug: 192.168.12.208 → CLEARTEXT_NOT_PERMITTED, PtzClient failed.
+    -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

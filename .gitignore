@@ -1,0 +1,43 @@
+# --- Android Gradle build outputs ---
+# These are regenerated on every build and routinely exceed GitHub's 100 MB
+# per-file push limit (especially APKs, intermediates, libVLC AARs).
+.gradle/
+build/
+*/build/
+**/build/
+.cxx/
+*/.cxx/
+**/.cxx/
+local.properties
+
+# Generated R.java / databinding / aapt outputs
+generated/
+
+# Android Studio + IntelliJ
+.idea/
+*.iml
+captures/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local test screenshots / build logs / pre-push scratch
+_shots/
+b*.txt
+build_out*.txt
+
+# APK / AAB outputs (regenerated; can be large — push to releases instead)
+*.apk
+*.aab
+
+# Keystores (NEVER commit signing material)
+*.jks
+*.keystore
+
+# Crash logs / profiling
+*.hprof
+hs_err_pid*
+
+# Backups
+*.bak
