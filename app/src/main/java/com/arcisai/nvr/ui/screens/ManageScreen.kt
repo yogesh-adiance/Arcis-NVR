@@ -14,6 +14,7 @@ import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.WifiOff
@@ -39,6 +40,7 @@ fun ManageScreen(vm: NvrViewModel) {
     var editing       by remember { mutableStateOf<JSONObject?>(null) }
     var pickingForFound by remember { mutableStateOf<JSONObject?>(null) }
     var addingThirdParty by remember { mutableStateOf(false) }
+    var showAddByIpInfo by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -94,13 +96,6 @@ fun ManageScreen(vm: NvrViewModel) {
             item { Spacer(Modifier.height(8.dp)) }
             item { SectionHeader("Add by IP") }
             item {
-                HintRow(
-                    "Scan LAN finds every ONVIF camera on the network (Hikvision, Dahua, " +
-                    "CP Plus, Axis, Vivotek, …) plus N1 cameras. Use this for any camera " +
-                    "that isn't on the network yet, or that doesn't advertise via ONVIF."
-                )
-            }
-            item {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -110,14 +105,21 @@ fun ManageScreen(vm: NvrViewModel) {
                     tonalElevation = 2.dp,
                 ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 4.dp,
+                            top = 14.dp, bottom = 14.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(Icons.Default.Add, contentDescription = null,
                             tint = MaterialTheme.colorScheme.primary)
                         Spacer(Modifier.width(8.dp))
-                        Text("Add by IP (Hikvision / Dahua / ONVIF / RTSP)",
-                            fontWeight = FontWeight.SemiBold)
+                        Text("Add by IP",
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f))
+                        // Info (i) — explains what Add by IP / Scan LAN are for.
+                        IconButton(onClick = { showAddByIpInfo = true }) {
+                            Icon(Icons.Outlined.Info, contentDescription = "About Add by IP",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                 }
             }
@@ -210,6 +212,26 @@ fun ManageScreen(vm: NvrViewModel) {
         } else {
             addingThirdParty = false
         }
+    }
+    if (showAddByIpInfo) {
+        AlertDialog(
+            onDismissRequest = { showAddByIpInfo = false },
+            icon = { Icon(Icons.Outlined.Info, contentDescription = null) },
+            title = { Text("Add by IP") },
+            text = {
+                Text(
+                    "Manually add a camera by its IP address — for Hikvision, Dahua, " +
+                    "ONVIF or generic RTSP cameras.\n\n" +
+                    "Use this for any camera that isn't on the network yet, or that " +
+                    "doesn't advertise itself via ONVIF.\n\n" +
+                    "Tip: “Scan LAN” auto-discovers ONVIF cameras (Hikvision, Dahua, " +
+                    "CP Plus, Axis, Vivotek, …) plus N1 cameras — try that first."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showAddByIpInfo = false }) { Text("Got it") }
+            },
+        )
     }
 }
 

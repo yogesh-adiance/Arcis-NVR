@@ -168,8 +168,32 @@ class NetSdkApi(val creds: NvrCredentials) {
     suspend fun reboot(): String = put("/netsdk/Reboot")
     suspend fun upgradeRate(): String = get("/netsdk/GetUpgradeRate")
 
+    /** Restore factory defaults. Same `R.*` run-op convention as the other
+     *  reset endpoints (R.Channel.SetIpcReboot, R.Wifi.Reset, …). */
+    suspend fun factoryReset(): String = put("/netsdk/R.Restore.FactorySetting")
+
     companion object {
         private val JSON_CT = "application/json".toMediaType()
+
+        /**
+         * HTTP-FLV playback URL for a recorded segment. The NVR streams recorded
+         * video over `/cgi-bin/flv.cgi` (FLV container, H.264/H.265 + G.711
+         * audio), credentials carried in the query string (no Basic auth).
+         * libVLC plays this directly. `channel0` is 0-indexed; times are Unix
+         * seconds (the TimeStart/TimeEnd from R.SearchRecord).
+         */
+        fun playbackFlvUrl(
+            host: String, port: Int,
+            username: String, password: String,
+            channel0: Int, beginTs: Long, endTs: Long,
+            mute: Boolean = false,
+        ): String {
+            val u = java.net.URLEncoder.encode(username, "UTF-8")
+            val p = java.net.URLEncoder.encode(password, "UTF-8")
+            val rnd = kotlin.random.Random.nextDouble()
+            return "http://$host:$port/cgi-bin/flv.cgi?u=$u&p=$p&mode=time" +
+                "&chn=$channel0&begin=$beginTs&end=$endTs&audio=54&mute=$mute&rnd=$rnd"
+        }
 
         /**
          * Build the camera-direct RTSP URL for an IPCamInfo entry. The NVR
@@ -193,27 +217,32 @@ class NetSdkApi(val creds: NvrCredentials) {
             val ip = ipCamEntry.optString("IPAddr").ifBlank { return null }
             val username = ipCamEntry.optString("Username", "admin")
             val password = ipCamEntry.optString("Password", "")
-            val port = ipCamEntry.optInt("Port", 554).let { if (it == 80 || it == 0) 554 else it }
             val protocol = ipCamEntry.optString("Protocolname", "N1").uppercase()
-            // Always emit `user:pass@`, even when password is empty — RTSP URI
-            // grammar requires the colon for the "user (blank pass)" case.
-            // Dropping it changes the URI semantics and most RTSP servers
-            // reject the result with 401. Verified live against AD-90: with-colon
-            // streams, no-colon returns 401.
+            // Always emit `user:pass@` — RTSP URI grammar requires the colon
+            // even when password is empty (verified live against AD-90).
             val userInfo = "$username:$password"
+            // IMPORTANT: IPCamInfo.Port stores the camera's CONTROL port
+            // (HTTP / ONVIF SOAP), NOT the RTSP port. RTSP is on its own
+            // well-known port — virtually always 554 across every vendor.
+            // Previous bug: we passed Port=8888 (ONVIF) into the RTSP URL
+            // → VLC stuck on "Connecting…" (no RTSP listener on 8888).
+            val rtspPort = 554
 
             return when (protocol) {
-                "HIKVISION" -> rtspHik(userInfo, ip, port, channelId, stream)
-                "DAHUA"     -> rtspDahua(userInfo, ip, port, channelId, stream)
+                "HIKVISION" -> rtspHik(userInfo, ip, rtspPort, channelId, stream)
+                "DAHUA"     -> rtspDahua(userInfo, ip, rtspPort, channelId, stream)
                 "RTSP"      -> ipCamEntry.optString("RtspUrl").ifBlank {
-                    rtspHik(userInfo, ip, port, channelId, stream)
+                    rtspHik(userInfo, ip, rtspPort, channelId, stream)
                 }
                 "ONVIF" -> {
                     val custom = ipCamEntry.optString("RtspUrl")
                     if (custom.isNotBlank()) custom
-                    else rtspHik(userInfo, ip, port, channelId, stream)
+                    // Profile_1 is the most common ONVIF stream alias.
+                    // TODO: replace with a real ONVIF GetStreamUri SOAP call
+                    //       once the user provides a working camera password.
+                    else "rtsp://$userInfo@$ip:$rtspPort/Profile_1"
                 }
-                else -> "rtsp://$userInfo@$ip:$port/ch0_$stream.264"  // N1 / HICHIP / fallback
+                else -> "rtsp://$userInfo@$ip:$rtspPort/ch0_$stream.264"  // N1 / HICHIP / fallback
             }
         }
 

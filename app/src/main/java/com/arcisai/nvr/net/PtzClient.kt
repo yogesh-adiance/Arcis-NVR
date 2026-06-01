@@ -82,7 +82,7 @@ class PtzClient(
             "N1", "HICHIP" -> n1Act(dir)?.let { n1Cmd(it, speed) } ?: false
             "HIKVISION"    -> hikContinuous(dir, speed)
             "DAHUA"        -> dahuaPtz(action = "start", code = dahuaCode(dir), speed = speed)
-            "ONVIF"        -> false   // v1: not implemented (camera-direct SOAP)
+            "ONVIF"        -> onvifMove(dir, speed)
             else           -> false
         }
     }
@@ -93,6 +93,7 @@ class PtzClient(
             "N1", "HICHIP" -> n1Cmd("stop", 0)
             "HIKVISION"    -> hikStop()
             "DAHUA"        -> dahuaPtz(action = "stop", code = "Stop", speed = 0)
+            "ONVIF"        -> onvifStop()
             else           -> false
         }
     }
@@ -104,6 +105,7 @@ class PtzClient(
             "N1", "HICHIP" -> n1Preset("GotoPreset", preset)
             "HIKVISION"    -> putXml("/ISAPI/PTZCtrl/channels/1/presets/$preset/goto", "")
             "DAHUA"        -> dahuaPtz(action = "start", code = "GotoPreset", arg2 = preset)
+            "ONVIF"        -> onvifPreset(goto = true, preset = preset)
             else           -> false
         }
     }
@@ -116,8 +118,64 @@ class PtzClient(
             "HIKVISION"    -> putXml("/ISAPI/PTZCtrl/channels/1/presets/$preset",
                 """<?xml version="1.0" encoding="UTF-8"?><PTZPreset><id>$preset</id><presetName>Preset $preset</presetName></PTZPreset>""")
             "DAHUA"        -> dahuaPtz(action = "start", code = "SetPreset", arg2 = preset)
+            "ONVIF"        -> onvifPreset(goto = false, preset = preset)
             else           -> false
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // ONVIF — Profile S/T PTZ via SOAP ContinuousMove / Stop / GotoPreset.
+    // Requires WS-UsernameToken auth. Verified live against TrueView at
+    // 192.168.12.130:8888 (HD_ONVIF_IPC firmware).
+    //
+    // ONVIF uses velocities in -1.0..1.0 (not direction strings). We map
+    // our 1..8 speed into 0.125..1.0 of the velocity range.
+    // ----------------------------------------------------------------------
+    private suspend fun onvifMove(dir: Dir, speed: Int): Boolean {
+        val (host, port) = onvifEndpoint() ?: return false
+        val token = onvifProfileToken(host, port) ?: return false
+        val s = (speed.coerceIn(1, 8) / 8.0)  // 0.125..1.0
+        val (pan, tilt, zoom) = when (dir) {
+            Dir.UP         -> Triple(0.0,  s,   0.0)
+            Dir.DOWN       -> Triple(0.0, -s,   0.0)
+            Dir.LEFT       -> Triple(-s,  0.0,  0.0)
+            Dir.RIGHT      -> Triple( s,  0.0,  0.0)
+            Dir.LEFT_UP    -> Triple(-s,   s,   0.0)
+            Dir.LEFT_DOWN  -> Triple(-s,  -s,   0.0)
+            Dir.RIGHT_UP   -> Triple( s,   s,   0.0)
+            Dir.RIGHT_DOWN -> Triple( s,  -s,   0.0)
+            Dir.ZOOM_IN    -> Triple(0.0, 0.0,  s)
+            Dir.ZOOM_OUT   -> Triple(0.0, 0.0, -s)
+        }
+        return OnvifMedia.ptzContinuousMove(host, port, user, pass, token, pan, tilt, zoom)
+    }
+
+    private suspend fun onvifStop(): Boolean {
+        val (host, port) = onvifEndpoint() ?: return false
+        val token = onvifProfileToken(host, port) ?: return false
+        return OnvifMedia.ptzStop(host, port, user, pass, token)
+    }
+
+    private suspend fun onvifPreset(goto: Boolean, preset: Int): Boolean {
+        val (host, port) = onvifEndpoint() ?: return false
+        val token = onvifProfileToken(host, port) ?: return false
+        return if (goto) OnvifMedia.ptzGotoPreset(host, port, user, pass, token, preset.toString())
+               else      OnvifMedia.ptzSetPreset (host, port, user, pass, token, preset.toString())
+    }
+
+    /** Resolve where to send ONVIF SOAP. LAN: camera IP + ONVIF port (usually
+     *  80 or 8888). Remote: 127.0.0.1 + libjuice HTTP-tunnel port, which
+     *  forwards via tcpsvd to the camera's ONVIF port (the watcher reads
+     *  IPCamInfo.Port so a TrueView on 8888 gets the right target). */
+    private suspend fun onvifEndpoint(): Pair<String, Int>? = httpEndpoint()
+
+    // Cache the first profile token across calls (it doesn't change).
+    @Volatile private var cachedProfileToken: String? = null
+    private suspend fun onvifProfileToken(host: String, port: Int): String? {
+        cachedProfileToken?.let { return it }
+        val t = OnvifMedia.getFirstProfileToken(host, port, user, pass)
+        if (t != null) cachedProfileToken = t
+        return t
     }
 
     // ----------------------------------------------------------------------
@@ -444,6 +502,6 @@ class PtzClient(
 
     companion object {
         private val XML_CT = "application/xml".toMediaType()
-        private val PTZ_PROTOCOLS = setOf("N1", "HICHIP", "HIKVISION", "DAHUA")
+        private val PTZ_PROTOCOLS = setOf("N1", "HICHIP", "HIKVISION", "DAHUA", "ONVIF")
     }
 }

@@ -45,7 +45,7 @@ private val SECTIONS = listOf(
         SettingsRow("encode", "Encoding",      "Resolution, bitrate, codec",         Icons.Default.Videocam),
         SettingsRow("color",  "Image / Color", "Brightness, contrast, rollover",     Icons.Default.Palette),
         SettingsRow("osd",    "OSD",           "Channel-name + time overlay",        Icons.Default.Tune),
-        SettingsRow("ptz",    "PTZ",           "Protocol, baud rate, address",       Icons.Default.MotionPhotosOn),
+        SettingsRow("ptz",    "PTZ",           "Pan / tilt / zoom on the Live view", Icons.Default.MotionPhotosOn),
     )),
     SettingsSection("Network", listOf(
         SettingsRow("network", "LAN",   "DHCP, IP, gateway, DNS, ports",     Icons.Default.Lan),

@@ -19,12 +19,24 @@ import java.util.concurrent.atomic.AtomicInteger
  * buffer of `total_size` bytes and emitted when all offsets have been filled.
  */
 object ChunkProtocol {
-    // Match the NVR-side provider's MAX_UDP_PAYLOAD. Reduced from 1100 to 500
-    // because Indian carrier 5G LTE caps path MTU below ~1100 + IP/UDP headers,
-    // and libjuice sets IP_DONTFRAG (kernel returns EMSGSIZE on oversized UDP).
-    const val MAX_UDP_PAYLOAD = 500
+    // MUST equal the NVR-side provider's MAX_UDP_PAYLOAD (provider_configurable.c
+    // and consumer_api.c both define 1100). The provider reassembles incoming
+    // frames by CHUNK INDEX, not byte offset:
+    //
+    //     chunk_index = offset / MAX_CHUNK_PAYLOAD;   // MAX_CHUNK_PAYLOAD = 1100-16 = 1184
+    //     if (!chunk_received[chunk_index]) { memcpy(buf+offset, ...); bytes_received += len; }
+    //
+    // so every chunk's offset must be a multiple of 1184 (i.e. we must send
+    // exactly 1184-byte payloads). A smaller value here (the old 500 → 484-byte
+    // payloads) makes offsets 0/484/968 all map to chunk_index 0; the provider's
+    // per-index dedup then DROPS the 2nd+ chunks of any frame > 484 bytes, so
+    // bytes_received never reaches expected_size, the frame never completes, the
+    // request is never forwarded to the NVR, and the consumer times out. This was
+    // the "Opening P2P tunnel… / timeout" regression. 1100 is already the value
+    // the provider chose to stay under the TURN-relay path MTU.
+    const val MAX_UDP_PAYLOAD = 1100
     const val HEADER_SIZE     = 16
-    const val MAX_CHUNK       = MAX_UDP_PAYLOAD - HEADER_SIZE   // 484
+    const val MAX_CHUNK       = MAX_UDP_PAYLOAD - HEADER_SIZE   // 1184
 }
 
 /** Build wire bytes for a single chunk. */

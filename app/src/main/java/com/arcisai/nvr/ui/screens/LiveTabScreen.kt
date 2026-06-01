@@ -33,6 +33,7 @@ fun LiveTabScreen(vm: NvrViewModel, onChannelTap: (Int) -> Unit) {
             if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
                 vm.refreshChannels()
                 vm.loadIpCamInfo()
+                vm.loadChannelStatus()
             }
         }
         lifecycle.addObserver(obs)
@@ -54,7 +55,7 @@ fun LiveTabScreen(vm: NvrViewModel, onChannelTap: (Int) -> Unit) {
                 },
                 actions = {
                     IconButton(onClick = {
-                        vm.refreshChannels(); vm.loadIpCamInfo()
+                        vm.refreshChannels(); vm.loadIpCamInfo(); vm.loadChannelStatus()
                     }) {
                         Icon(Icons.Default.Refresh, contentDescription = "Refresh")
                     }
@@ -94,11 +95,16 @@ fun LiveTabScreen(vm: NvrViewModel, onChannelTap: (Int) -> Unit) {
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         items(vm.channels, key = { it.id }) { ch ->
+                            val configured = ch.enabled && ch.ipAddr.isNotBlank()
+                            val connected = configured && vm.isChannelConnected(ch.id)
                             CameraTile(
-                                title    = "Channel ${ch.id + 1}",
-                                subtitle = ch.modelName.ifBlank { ch.ipAddr.ifBlank { "no camera" } },
-                                enabled  = ch.enabled && ch.ipAddr.isNotBlank(),
-                                onClick  = { onChannelTap(ch.id) },
+                                title     = "Channel ${ch.id + 1}",
+                                subtitle  = if (!configured) "no camera"
+                                            else if (!connected) "Camera closed"
+                                            else ch.modelName.ifBlank { ch.ipAddr },
+                                configured = configured,
+                                connected  = connected,
+                                onClick    = { onChannelTap(ch.id) },
                             )
                         }
                     }
@@ -109,15 +115,23 @@ fun LiveTabScreen(vm: NvrViewModel, onChannelTap: (Int) -> Unit) {
 }                  // fun LiveTabScreen
 
 @Composable
-private fun CameraTile(title: String, subtitle: String, enabled: Boolean, onClick: () -> Unit) {
+private fun CameraTile(
+    title: String,
+    subtitle: String,
+    configured: Boolean,
+    connected: Boolean,
+    onClick: () -> Unit,
+) {
+    // Only a currently-connected camera can be opened; offline/closed and empty
+    // slots are non-tappable and show a blank (black) preview.
     ElevatedCard(
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(16f / 11f)
-            .clickable(enabled = enabled) { onClick() },
+            .clickable(enabled = connected) { onClick() },
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.elevatedCardColors(
-            containerColor = if (enabled) MaterialTheme.colorScheme.surface
+            containerColor = if (connected) MaterialTheme.colorScheme.surface
                              else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
         ),
     ) {
@@ -130,16 +144,27 @@ private fun CameraTile(title: String, subtitle: String, enabled: Boolean, onClic
                     .background(Color.Black),
                 contentAlignment = Alignment.Center,
             ) {
-                if (enabled) {
-                    Icon(Icons.Default.PlayArrow,
+                when {
+                    // Live camera — show the play affordance.
+                    connected -> Icon(Icons.Default.PlayArrow,
                         contentDescription = null,
                         tint = Color.White.copy(alpha = 0.75f),
                         modifier = Modifier.size(40.dp))
-                } else {
-                    Icon(Icons.Default.VideocamOff,
+                    // Configured but the camera is closed/offline — blank preview
+                    // with a small offline hint instead of a (non-working) play button.
+                    configured -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(Icons.Default.VideocamOff,
+                            contentDescription = null,
+                            tint = Color.White.copy(alpha = 0.4f),
+                            modifier = Modifier.size(32.dp))
+                        Spacer(Modifier.height(4.dp))
+                        Text("Camera closed", color = Color.White.copy(alpha = 0.6f), fontSize = 11.sp)
+                    }
+                    // Empty slot — nothing assigned. Blank preview.
+                    else -> Icon(Icons.Default.VideocamOff,
                         contentDescription = null,
-                        tint = Color.White.copy(alpha = 0.5f),
-                        modifier = Modifier.size(36.dp))
+                        tint = Color.White.copy(alpha = 0.3f),
+                        modifier = Modifier.size(32.dp))
                 }
             }
             Spacer(Modifier.height(8.dp))
