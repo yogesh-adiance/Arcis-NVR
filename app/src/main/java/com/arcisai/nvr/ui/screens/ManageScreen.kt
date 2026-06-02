@@ -14,8 +14,9 @@ import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.*
@@ -26,6 +27,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.arcisai.nvr.viewmodel.NvrViewModel
@@ -40,7 +42,6 @@ fun ManageScreen(vm: NvrViewModel) {
     var editing       by remember { mutableStateOf<JSONObject?>(null) }
     var pickingForFound by remember { mutableStateOf<JSONObject?>(null) }
     var addingThirdParty by remember { mutableStateOf(false) }
-    var showAddByIpInfo by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -96,6 +97,13 @@ fun ManageScreen(vm: NvrViewModel) {
             item { Spacer(Modifier.height(8.dp)) }
             item { SectionHeader("Add by IP") }
             item {
+                HintRow(
+                    "Scan LAN finds every ONVIF camera on the network (Hikvision, Dahua, " +
+                    "CP Plus, Axis, Vivotek, …) plus N1 cameras. Use this for any camera " +
+                    "that isn't on the network yet, or that doesn't advertise via ONVIF."
+                )
+            }
+            item {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -105,21 +113,14 @@ fun ManageScreen(vm: NvrViewModel) {
                     tonalElevation = 2.dp,
                 ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 4.dp,
-                            top = 14.dp, bottom = 14.dp),
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(Icons.Default.Add, contentDescription = null,
                             tint = MaterialTheme.colorScheme.primary)
                         Spacer(Modifier.width(8.dp))
-                        Text("Add by IP",
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.weight(1f))
-                        // Info (i) — explains what Add by IP / Scan LAN are for.
-                        IconButton(onClick = { showAddByIpInfo = true }) {
-                            Icon(Icons.Outlined.Info, contentDescription = "About Add by IP",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
+                        Text("Add by IP (Hikvision / Dahua / ONVIF / RTSP)",
+                            fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
@@ -212,26 +213,6 @@ fun ManageScreen(vm: NvrViewModel) {
         } else {
             addingThirdParty = false
         }
-    }
-    if (showAddByIpInfo) {
-        AlertDialog(
-            onDismissRequest = { showAddByIpInfo = false },
-            icon = { Icon(Icons.Outlined.Info, contentDescription = null) },
-            title = { Text("Add by IP") },
-            text = {
-                Text(
-                    "Manually add a camera by its IP address — for Hikvision, Dahua, " +
-                    "ONVIF or generic RTSP cameras.\n\n" +
-                    "Use this for any camera that isn't on the network yet, or that " +
-                    "doesn't advertise itself via ONVIF.\n\n" +
-                    "Tip: “Scan LAN” auto-discovers ONVIF cameras (Hikvision, Dahua, " +
-                    "CP Plus, Axis, Vivotek, …) plus N1 cameras — try that first."
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = { showAddByIpInfo = false }) { Text("Got it") }
-            },
-        )
     }
 }
 
@@ -445,6 +426,7 @@ private fun EditIpcDialog(
     ) }
     var username by remember { mutableStateOf(initial.optString("Username", "admin")) }
     var password by remember { mutableStateOf(initial.optString("Password")) }
+    var pwdVisible by remember { mutableStateOf(false) }
     var model    by remember { mutableStateOf(initial.optString("Modelname")) }
     var enable   by remember { mutableStateOf(initial.optString("Enable") == "True") }
     var rtspUrl  by remember { mutableStateOf(initial.optString("RtspUrl")) }
@@ -519,9 +501,17 @@ private fun EditIpcDialog(
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = password, onValueChange = { password = it },
                     label = { Text("Password") }, singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
+                    visualTransformation = if (pwdVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    trailingIcon = {
+                        IconButton(onClick = { pwdVisible = !pwdVisible }) {
+                            Icon(
+                                imageVector = if (pwdVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                contentDescription = if (pwdVisible) "Hide password" else "Show password",
+                            )
+                        }
+                    })
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = model, onValueChange = { model = it },
                     label = { Text("Model name (optional)") }, singleLine = true,
@@ -559,6 +549,7 @@ private fun AddThirdPartyDialog(
     var port     by remember { mutableStateOf("554") }
     var username by remember { mutableStateOf("admin") }
     var password by remember { mutableStateOf("") }
+    var pwdVisible by remember { mutableStateOf(false) }
     var model    by remember { mutableStateOf("") }
     var rtspUrl  by remember { mutableStateOf("") }
     var slotId   by remember { mutableStateOf(firstEmptySlot(slots) ?: 0) }
@@ -637,9 +628,17 @@ private fun AddThirdPartyDialog(
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = password, onValueChange = { password = it },
                     label = { Text("Password") }, singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
+                    visualTransformation = if (pwdVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    trailingIcon = {
+                        IconButton(onClick = { pwdVisible = !pwdVisible }) {
+                            Icon(
+                                imageVector = if (pwdVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                contentDescription = if (pwdVisible) "Hide password" else "Show password",
+                            )
+                        }
+                    })
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = model, onValueChange = { model = it },
                     label = { Text("Model name (optional)") }, singleLine = true,

@@ -1,268 +1,187 @@
 package com.arcisai.nvr.ui.screens
 
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import org.json.JSONArray
-import org.json.JSONObject
 
-/**
- * Shared chrome + a generic JSON viewer/editor used by every settings panel.
- *
- * The NVR's /netsdk endpoints return (and accept) firmware-specific nested
- * JSON whose exact field names vary by model. Rather than hand-code a rigid
- * form per panel, the editor walks the returned object and renders each scalar
- * leaf as a field — mutating the *same* JSONObject in place (the one the
- * ViewModel holds), so saving just PUTs it back. This mirrors EncodingScreen's
- * read-modify-write pattern and works regardless of the firmware's schema.
- */
+// ---------------------------------------------------------------------------
+// Shared composables for the Settings sub-screens (DeviceInfo / General /
+// Network / SMTP / Wi-Fi / etc.).  Keeps each screen short + makes the
+// form style consistent across the section.
+// ---------------------------------------------------------------------------
 
-@OptIn(ExperimentalMaterial3Api::class)
+/** Status banner shown at the top of every settings screen. Reads
+ *  vm.settingStatus and renders a thin tonal Surface if non-null. */
 @Composable
-fun SettingsScaffold(
-    title: String,
-    onBack: () -> Unit,
-    status: String?,
-    loading: Boolean = false,
-    onRefresh: (() -> Unit)? = null,
-    content: @Composable ColumnScope.() -> Unit,
-) {
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text(title, fontWeight = FontWeight.SemiBold) },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                actions = {
-                    if (onRefresh != null) {
-                        IconButton(onClick = onRefresh) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Refresh")
-                        }
-                    }
-                },
-            )
-        },
-    ) { padding ->
-        Column(
-            modifier = Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState()),
-        ) {
-            status?.let {
-                Surface(tonalElevation = 2.dp, modifier = Modifier.fillMaxWidth()) {
-                    Text(it, modifier = Modifier.padding(12.dp), fontSize = 12.sp)
-                }
-            }
-            if (loading) {
-                Box(Modifier.fillMaxWidth().padding(48.dp), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
-                }
-            } else {
-                content()
-            }
-        }
+fun SettingsStatusBar(status: String?) {
+    if (status.isNullOrBlank()) return
+    Surface(tonalElevation = 2.dp, modifier = Modifier.fillMaxWidth()) {
+        Text(status, modifier = Modifier.padding(12.dp), fontSize = 12.sp)
     }
 }
 
-/**
- * Generic "load a JSON value, edit its leaves, PUT it back" settings screen.
- * Handles both a top-level JSONObject and a top-level JSONArray (e.g. per-channel
- * Color). [value] is mutated in place by the editor; [onApply] just saves it.
- * [footer] adds screen-specific actions (Test SMTP, PPPoE start/stop, …).
- */
+/** Show a Snackbar whenever `status` changes — used so the user actually
+ *  sees Apply-button feedback even when scrolled to the bottom of a form.
+ *  Pass the SnackbarHostState into the Scaffold via `snackbarHost = { SnackbarHost(hostState) }`. */
 @Composable
-fun JsonEditScreen(
-    title: String,
-    value: Any?,
-    status: String?,
-    onBack: () -> Unit,
-    onRefresh: () -> Unit,
-    onApply: () -> Unit,
-    footer: (@Composable ColumnScope.() -> Unit)? = null,
-) {
-    SettingsScaffold(
-        title = title,
-        onBack = onBack,
-        status = status,
-        loading = value == null && status == null,
-        onRefresh = onRefresh,
-    ) {
-        when (value) {
-            is JSONObject -> JsonObjectEditor(value)
-            is JSONArray -> {
-                for (i in 0 until value.length()) {
-                    val item = value.opt(i)
-                    if (item is JSONObject) {
-                        Text(
-                            "Channel ${i + 1}",
-                            modifier = Modifier.fillMaxWidth()
-                                .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 2.dp),
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                        JsonObjectEditor(item)
-                        HorizontalDivider()
-                    }
-                }
-            }
-        }
-        if (value != null) {
-            Spacer(Modifier.height(12.dp))
-            Button(
-                onClick = onApply,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-            ) { Text("Apply") }
-            footer?.invoke(this)
-            Spacer(Modifier.height(24.dp))
+fun rememberSettingsSnackbar(status: String?): SnackbarHostState {
+    val hostState = remember { SnackbarHostState() }
+    LaunchedEffect(status) {
+        if (!status.isNullOrBlank()) {
+            hostState.showSnackbar(status)
         }
     }
+    return hostState
 }
 
-/** Read-only recursive key/value display for one JSON object. */
+/** Vertical block heading like "Network" / "Email / SMTP". */
 @Composable
-fun JsonKeyValueList(obj: JSONObject, depth: Int = 0) {
-    val keys = obj.keys().asSequence().toList()
-    for (key in keys) {
-        when (val v = obj.opt(key)) {
-            is JSONObject -> {
-                SectionHeader(key, depth)
-                JsonKeyValueList(v, depth + 1)
-            }
-            is JSONArray -> {
-                SectionHeader("$key [${v.length()}]", depth)
-                for (i in 0 until v.length()) {
-                    val item = v.opt(i)
-                    if (item is JSONObject) {
-                        SectionHeader("#${i + 1}", depth + 1)
-                        JsonKeyValueList(item, depth + 2)
-                    } else {
-                        KeyValueRow("[${i}]", item?.toString() ?: "", depth + 1)
-                    }
-                }
-            }
-            else -> KeyValueRow(key, v?.toString() ?: "", depth)
-        }
-    }
-}
-
-@Composable
-private fun KeyValueRow(key: String, value: String, depth: Int) {
-    Row(
-        modifier = Modifier.fillMaxWidth()
-            .padding(start = (16 + depth * 12).dp, end = 16.dp, top = 4.dp, bottom = 4.dp),
-        verticalAlignment = Alignment.Top,
-    ) {
-        Text(key, fontSize = 13.sp, fontWeight = FontWeight.Medium,
-            modifier = Modifier.weight(0.45f),
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, fontSize = 13.sp, modifier = Modifier.weight(0.55f))
-    }
-}
-
-@Composable
-private fun SectionHeader(text: String, depth: Int) {
+fun SectionLabel(text: String) {
     Text(
         text,
-        modifier = Modifier.fillMaxWidth()
-            .padding(start = (16 + depth * 12).dp, end = 16.dp, top = 10.dp, bottom = 2.dp),
-        fontSize = 12.sp,
-        fontWeight = FontWeight.Bold,
-        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 13.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
 }
 
-/**
- * Recursive editor. Renders scalar leaves as Switches ("True"/"False" or real
- * booleans) or text fields; recurses into nested objects/arrays-of-objects.
- * All edits mutate [obj] in place. Call the screen's save action afterwards.
- */
+/** Read-only "label: value" row used for things like firmware version
+ *  that the user can't edit. */
 @Composable
-fun JsonObjectEditor(obj: JSONObject, depth: Int = 0) {
-    val keys = obj.keys().asSequence().toList()
-    for (key in keys) {
-        when (val v = obj.opt(key)) {
-            is JSONObject -> {
-                SectionHeader(key, depth)
-                JsonObjectEditor(v, depth + 1)
-            }
-            is JSONArray -> {
-                SectionHeader("$key [${v.length()}]", depth)
-                for (i in 0 until v.length()) {
-                    val item = v.opt(i)
-                    if (item is JSONObject) {
-                        SectionHeader("#${i + 1}", depth + 1)
-                        JsonObjectEditor(item, depth + 2)
-                    } else {
-                        // Scalar array element — edit by index.
-                        ScalarField(key = "[${i}]", original = item, depth = depth + 1) { newVal ->
-                            v.put(i, newVal)
-                        }
-                    }
+fun ReadOnlyRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(label, fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, fontSize = 14.sp,
+            fontWeight = FontWeight.Medium)
+    }
+}
+
+/** Plain editable text field, full width with a label above. `onChange`
+ *  is last so callers can use a trailing-lambda style.  When [password]
+ *  is true an eye toggle appears on the right to reveal the value. */
+@Composable
+fun TextSetting(
+    label: String,
+    value: String,
+    keyboardType: KeyboardType = KeyboardType.Text,
+    password: Boolean = false,
+    singleLine: Boolean = true,
+    onChange: (String) -> Unit,
+) {
+    var pwdVisible by remember { mutableStateOf(false) }
+    OutlinedTextField(
+        value = value,
+        onValueChange = onChange,
+        label = { Text(label) },
+        singleLine = singleLine,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+        visualTransformation = if (password && !pwdVisible) PasswordVisualTransformation() else VisualTransformation.None,
+        trailingIcon = if (!password) null else {
+            {
+                IconButton(onClick = { pwdVisible = !pwdVisible }) {
+                    Icon(
+                        imageVector = if (pwdVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                        contentDescription = if (pwdVisible) "Hide password" else "Show password",
+                    )
                 }
             }
-            else -> ScalarField(key = key, original = v, depth = depth) { newVal ->
-                obj.put(key, newVal)
+        },
+    )
+}
+
+/** Numeric edit field. Strips non-digits as the user types so we can
+ *  trust the value when saving. */
+@Composable
+fun NumberSetting(label: String, value: Int, onChange: (Int) -> Unit) {
+    var text by remember(value) { mutableStateOf(value.toString()) }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { v ->
+            val filtered = v.filter(Char::isDigit).take(6)
+            text = filtered
+            filtered.toIntOrNull()?.let(onChange)
+        },
+        label = { Text(label) },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+    )
+}
+
+/** A boolean toggle row. The NVR stores booleans as "True"/"False"
+ *  strings; helpers below convert. */
+@Composable
+fun SwitchSetting(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(label, fontSize = 14.sp, modifier = Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
+
+/** Single-choice dropdown bound to a free-form value (read-only field +
+ *  expanded menu of provided options). */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DropdownSetting(
+    label: String,
+    value: String,
+    options: List<String>,
+    onPick: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = !expanded },
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+    ) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            modifier = Modifier.fillMaxWidth().menuAnchor(),
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            options.forEach { opt ->
+                DropdownMenuItem(
+                    text = { Text(opt) },
+                    onClick = {
+                        onPick(opt)
+                        expanded = false
+                    },
+                )
             }
         }
     }
 }
 
-/** One editable scalar. Preserves the original JSON type on write-back. */
-@Composable
-private fun ScalarField(key: String, original: Any?, depth: Int, onChange: (Any) -> Unit) {
-    val startPad = (16 + depth * 12).dp
-    val asString = original?.toString() ?: ""
+/** Helper: convert NVR's "True" / "False" string → Boolean. */
+fun nvrBool(raw: String?): Boolean = raw == "True" || raw == "true"
 
-    // Boolean-like values (real Boolean or the firmware's "True"/"False"
-    // strings) get a Switch.
-    val isBoolString = asString.equals("true", true) || asString.equals("false", true)
-    if (original is Boolean || isBoolString) {
-        var checked by remember(asString) { mutableStateOf(asString.equals("true", true)) }
-        Row(
-            modifier = Modifier.fillMaxWidth()
-                .padding(start = startPad, end = 16.dp, top = 4.dp, bottom = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(key, fontSize = 13.sp, modifier = Modifier.weight(1f))
-            Switch(checked = checked, onCheckedChange = {
-                checked = it
-                // Write back in the same shape the firmware sent.
-                if (original is Boolean) onChange(it) else onChange(if (it) "True" else "False")
-            })
-        }
-        return
-    }
-
-    var text by remember(asString) { mutableStateOf(asString) }
-    OutlinedTextField(
-        value = text,
-        onValueChange = {
-            text = it
-            onChange(coerceToType(original, it))
-        },
-        label = { Text(key) },
-        singleLine = true,
-        modifier = Modifier.fillMaxWidth()
-            .padding(start = startPad, end = 16.dp, top = 4.dp, bottom = 4.dp),
-    )
-}
-
-/** Keep numeric fields numeric so the NVR's parser doesn't reject quoted ints. */
-private fun coerceToType(original: Any?, text: String): Any = when (original) {
-    is Int    -> text.toIntOrNull() ?: text
-    is Long   -> text.toLongOrNull() ?: text
-    is Double -> text.toDoubleOrNull() ?: text
-    else      -> text
-}
+/** Helper: convert Boolean → NVR's "True" / "False" string. */
+fun nvrStrBool(b: Boolean): String = if (b) "True" else "False"

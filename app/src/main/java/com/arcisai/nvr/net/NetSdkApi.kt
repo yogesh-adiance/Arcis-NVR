@@ -126,9 +126,14 @@ class NetSdkApi(val creds: NvrCredentials) {
     suspend fun general(): JSONObject = getJson("/netsdk/General")
     suspend fun setGeneral(body: JSONObject): String = put("/netsdk/General", body.toString())
     suspend fun deviceInfo(): JSONObject = getJson("/netsdk/Stat/DeviceInfo")
-    suspend fun localTime(): String = get("/netsdk/LocalTime")
-    suspend fun utcTime(): String = get("/netsdk/UtcTime")
-    suspend fun setLocalTime(body: String): String = put("/netsdk/S.SetLocalTime", body)
+    // Verified against firmware 3.6.6.20TestF: time + NTP + SummerTime live under
+    // /netsdk/General/Time, NOT /netsdk/LocalTime (that path returns "Save failure" stub).
+    suspend fun generalTime(): JSONObject = getJson("/netsdk/General/Time")
+    suspend fun setGeneralTime(body: JSONObject): String =
+        put("/netsdk/General/Time", body.toString())
+    suspend fun generalMaintenance(): JSONObject = getJson("/netsdk/General/Maintenance")
+    suspend fun setGeneralMaintenance(body: JSONObject): String =
+        put("/netsdk/General/Maintenance", body.toString())
 
     suspend fun maxChannels(): Int =
         deviceInfo().optString("MAX_CHN").toIntOrNull()?.takeIf { it in 1..32 } ?: 4
@@ -168,32 +173,8 @@ class NetSdkApi(val creds: NvrCredentials) {
     suspend fun reboot(): String = put("/netsdk/Reboot")
     suspend fun upgradeRate(): String = get("/netsdk/GetUpgradeRate")
 
-    /** Restore factory defaults. Same `R.*` run-op convention as the other
-     *  reset endpoints (R.Channel.SetIpcReboot, R.Wifi.Reset, …). */
-    suspend fun factoryReset(): String = put("/netsdk/R.Restore.FactorySetting")
-
     companion object {
         private val JSON_CT = "application/json".toMediaType()
-
-        /**
-         * HTTP-FLV playback URL for a recorded segment. The NVR streams recorded
-         * video over `/cgi-bin/flv.cgi` (FLV container, H.264/H.265 + G.711
-         * audio), credentials carried in the query string (no Basic auth).
-         * libVLC plays this directly. `channel0` is 0-indexed; times are Unix
-         * seconds (the TimeStart/TimeEnd from R.SearchRecord).
-         */
-        fun playbackFlvUrl(
-            host: String, port: Int,
-            username: String, password: String,
-            channel0: Int, beginTs: Long, endTs: Long,
-            mute: Boolean = false,
-        ): String {
-            val u = java.net.URLEncoder.encode(username, "UTF-8")
-            val p = java.net.URLEncoder.encode(password, "UTF-8")
-            val rnd = kotlin.random.Random.nextDouble()
-            return "http://$host:$port/cgi-bin/flv.cgi?u=$u&p=$p&mode=time" +
-                "&chn=$channel0&begin=$beginTs&end=$endTs&audio=54&mute=$mute&rnd=$rnd"
-        }
 
         /**
          * Build the camera-direct RTSP URL for an IPCamInfo entry. The NVR

@@ -44,9 +44,30 @@ fun LiveScreen(viewModel: NvrViewModel, channelId: Int, onBack: () -> Unit) {
     // The bound camera IP for this channel — refetch the stream URL whenever
     // this changes (e.g. user reassigned the camera while on another tab).
     val boundIp = viewModel.channels.firstOrNull { it.id == channelId }?.ipAddr ?: ""
+
+    // Retry token — bumping it re-runs the URL-fetch LaunchedEffect, used by
+    // the manual Retry button when the publisher returns null on the first try.
+    var retryToken by remember(channelId, useSub, boundIp) { mutableStateOf(0) }
     var rtsp by remember(channelId, useSub, boundIp) { mutableStateOf<String?>(null) }
-    LaunchedEffect(channelId, useSub, boundIp) {
-        rtsp = viewModel.ensureChannelStreamUrl(channelId, stream = if (useSub) 1 else 0)
+    // Tracks whether we exhausted auto-retries and should surface a Retry CTA.
+    var fetchExhausted by remember(channelId, useSub, boundIp) { mutableStateOf(false) }
+    val remoteMode = viewModel.credentials?.remote == true
+
+    LaunchedEffect(channelId, useSub, boundIp, retryToken) {
+        fetchExhausted = false
+        rtsp = null
+        // Up to 3 attempts with linear back-off. /api/channels/<n>/stream
+        // sometimes 502s for ~1-2s right after the publisher restarts; the
+        // retry rides over that without bothering the user.
+        var attempts = 0
+        while (rtsp == null && attempts < 3) {
+            attempts++
+            rtsp = viewModel.ensureChannelStreamUrl(channelId, stream = if (useSub) 1 else 0)
+            if (rtsp == null && attempts < 3) {
+                kotlinx.coroutines.delay(1500L * attempts)
+            }
+        }
+        if (rtsp == null) fetchExhausted = true
     }
 
     // Whether PTZ is plausibly available for this channel.
@@ -107,10 +128,31 @@ fun LiveScreen(viewModel: NvrViewModel, channelId: Int, onBack: () -> Unit) {
                 val r = rtsp
                 if (r == null) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        CircularProgressIndicator(color = Color.White,
-                            modifier = Modifier.size(36.dp))
-                        Spacer(Modifier.height(10.dp))
-                        Text("Opening P2P tunnel…", color = Color.White)
+                        if (fetchExhausted) {
+                            // Publisher returned no URL three times running —
+                            // either the channel is unassigned, the camera is
+                            // offline, or the publisher is restarting.
+                            Text("Couldn't reach stream",
+                                color = Color.White,
+                                fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                if (remoteMode) "The P2P tunnel didn't come up. Tap retry."
+                                else "The NVR's publisher didn't return a URL.",
+                                color = Color.White.copy(alpha = 0.85f),
+                                fontSize = 12.sp,
+                            )
+                            Spacer(Modifier.height(12.dp))
+                            Button(onClick = { retryToken++ }) { Text("Retry") }
+                        } else {
+                            CircularProgressIndicator(color = Color.White,
+                                modifier = Modifier.size(36.dp))
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                if (remoteMode) "Opening P2P tunnel…" else "Connecting…",
+                                color = Color.White,
+                            )
+                        }
                     }
                 } else {
                     key(r, forceTcp) {
@@ -363,6 +405,16 @@ private fun VlcRtspPlayer(rtspUrl: String, forceTcp: Boolean) {
             player.setEventListener(null)
             player.release()
             libVlc.release()
+        }
+    }
+
+    // Watchdog: VLC sometimes hangs in "Connecting…" without firing
+    // EncounteredError (e.g. RTSP TCP open succeeded but DESCRIBE never
+    // completes). Surface a manual Retry after 12s of no playback.
+    LaunchedEffect(rtspUrl, forceTcp, retryEpoch) {
+        delay(12000)
+        if (!playing && error == null) {
+            error = "Stream didn't start in 12s. Try again, or switch TCP/UDP or Main/Sub."
         }
     }
 
