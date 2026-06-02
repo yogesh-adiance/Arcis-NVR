@@ -10,8 +10,9 @@ import com.arcisai.nvr.data.ChannelCache
 import com.arcisai.nvr.data.CredentialStore
 import com.arcisai.nvr.data.NvrCredentials
 import com.arcisai.nvr.net.NetSdkApi
+import com.arcisai.nvr.net.NetSdkException
 import com.arcisai.nvr.net.OnvifDiscovery
-import com.arcisai.nvr.net.OnvifMedia
+import com.arcisai.nvr.net.PublisherApi
 import com.arcisai.nvr.net.PtzClient
 import com.arcisai.nvr.net.RtspTlsProxy
 import com.arcisai.nvr.net.SubnetSweep
@@ -180,11 +181,11 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     fun logout() {
         sessions.values.forEach { runCatching { it.close() } }
         sessions.clear()
-        httpTunnelSessions.values.forEach { runCatching { it.close() } }
-        httpTunnelSessions.clear()
         tlsProxies.values.forEach { runCatching { it.close() } }
         tlsProxies.clear()
-        onvifStreamUrlCache.clear()
+        publisherTunnel?.let { runCatching { it.close() } }
+        publisherTunnel = null
+        publisherApiInstance = null
         store.clear()
         cache.clear()
         credentials = null
@@ -199,74 +200,101 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     // Lazy-opened on first stream, kept until logout / channel rebind.
     private val tlsProxies = ConcurrentHashMap<Int, RtspTlsProxy>()
 
+    /** Cached publisher (:8080) tunnel session in Remote mode. service_id
+     *  is `<deviceId>-pub` and the publisher config on the NVR exposes
+     *  :8080 via libjuice (P2P_PORT=9109). One session shared for all
+     *  /api/channels and /ptz calls. */
+    @Volatile private var publisherTunnel: RemoteSession? = null
+
+    /** Lazy PublisherApi — rebuilt on credential change. Resolves base URL
+     *  on every request: LAN → http://<host>:8080; Remote → opens publisher
+     *  tunnel + http://127.0.0.1:<localPort>. */
+    @Volatile private var publisherApiInstance: PublisherApi? = null
+
+    private fun publisher(): PublisherApi? {
+        val creds = credentials ?: return null
+        publisherApiInstance?.let { return it }
+        val api = PublisherApi(creds) { baseUrlForPublisher() }
+        publisherApiInstance = api
+        return api
+    }
+
+    private suspend fun baseUrlForPublisher(): String? {
+        val creds = credentials ?: return null
+        if (!creds.remote) return "http://${creds.host}:8080"
+        val port = ensurePublisherTunnel() ?: return null
+        return "http://127.0.0.1:$port"
+    }
+
+    /** Open (or reuse) the libjuice tunnel for the publisher's :8080.
+     *  Mirrors [ensureChannelHttpTunnel] but bound to a single service_id
+     *  (`<deviceId>-pub`) since /api/channels covers all channels. */
+    private suspend fun ensurePublisherTunnel(): Int? {
+        val creds = credentials ?: return null
+        if (!creds.remote) return null
+        val cur = publisherTunnel
+        if (cur != null && cur.isAlive) return cur.localPort
+        cur?.let { runCatching { it.close() } }
+        publisherTunnel = null
+
+        val sid = "${creds.deviceId}-pub"
+        android.util.Log.i("NvrVM-Pub", "opening publisher tunnel $sid")
+        val ns = RemoteSession(sid, remoteConfig)
+        if (!ns.connect()) {
+            ns.close()
+            android.util.Log.w("NvrVM-Pub", "publisher tunnel connect failed for $sid")
+            return null
+        }
+        publisherTunnel = ns
+        android.util.Log.i("NvrVM-Pub", "publisher tunnel ready: $sid -> 127.0.0.1:${ns.localPort}")
+        return ns.localPort
+    }
+
     /**
-     * RTSP URL the libVLC player should open for a given channel. Dispatches
-     * on the channel's Protocolname (N1 / HIKVISION / DAHUA / ONVIF / RTSP) —
-     * see [NetSdkApi.cameraRtspUrl] / [NetSdkApi.cameraRtspUrlTunneled].
+     * RTSP URL the libVLC player should open for a given channel.
      *
-     * Three transforms applied in order:
-     *  1. Build the per-vendor URL from IPCamInfo (or honor RtspUrl override)
-     *  2. If Remote (P2P) mode → swap the host:port for a libjuice localhost tunnel
-     *  3. If the URL is `rtsps://` (RTSP-over-TLS) → spin up a [RtspTlsProxy]
-     *     and rewrite to plain `rtsp://127.0.0.1:<proxyPort>/...` so libVLC
-     *     (which doesn't support rtsps on Android) can play it. Verified live
-     *     against TrueView CP-E31Q family cams which only serve TLS RTSP.
+     * The publisher on the NVR's :8080 owns all per-brand camera knowledge:
+     * for each channel it runs ONVIF GetStreamUri (CP Plus, TrueView,
+     * Hikvision ONVIF), HTTP Digest / WS-UsernameToken auth, TLS detection
+     * (rtsps://), and the N1/HICHIP /ch0_M.264 fallback. The app just
+     * fetches /api/channels/<n>/stream and gets back the resolved URL.
+     *
+     * Three transforms still applied here on the app side:
+     *  1. GET /api/channels/<n>/stream — over LAN (:8080 direct) or via
+     *     the publisher libjuice tunnel in Remote mode. URL comes back
+     *     with creds pre-injected and rtsps:// applied where needed.
+     *  2. Remote mode: the URL still references the camera's LAN IP, so
+     *     rewrite its host:port to the per-channel RTSP libjuice tunnel
+     *     (NVR's tcpsvd 5540+N → camera:554).
+     *  3. rtsps:// → spin up a [RtspTlsProxy] on 127.0.0.1 so libVLC's
+     *     Android build (no native rtsps) can consume it.
+     *
+     * `stream` follows the publisher's convention: 1=sub, 0=main.
      */
     suspend fun ensureChannelStreamUrl(channelId: Int, stream: Int = 1): String? {
         val creds = credentials ?: return null
-        val entry = findIpCamEntry(channelId) ?: return null
+        val api = publisher() ?: return null
+        val streamType = if (stream == 0) "main" else "sub"
 
-        // For ONVIF cameras, the URL path varies per vendor (TrueView uses
-        // /ch0_0.264 over rtsps, Vivotek uses /live.sdp, Axis uses /axis-media/
-        // media.amp, etc.) — and the NVR's IPCamInfo schema doesn't have a
-        // place to store the camera's literal URL. So we ask the camera
-        // itself via ONVIF GetStreamUri (one SOAP call). Result is cached for
-        // the channel lifetime so the SOAP overhead happens once.
-        //
-        // P2P mode: the SOAP call is routed through the per-channel HTTP
-        // libjuice tunnel (NVR's tcpsvd 8540+N → camera:ONVIF-port), and the
-        // rtsps URL we get back is rewritten to point at the per-channel RTSP
-        // libjuice tunnel (NVR's tcpsvd 5540+N → camera:554). The downstream
-        // TLS proxy then handshakes through that pipe end-to-end with the
-        // camera, so libVLC sees plain rtsp://127.0.0.1:<proxyPort>/...
-        val protocol = entry.optString("Protocolname").uppercase()
-        if (protocol == "ONVIF") {
-            val cached = onvifStreamUrlCache[Pair(channelId, stream)]
-            val onvifUrl = cached ?: run {
-                val (soapHost, soapPort) = if (creds.remote) {
-                    val httpPort = ensureChannelHttpTunnel(channelId) ?: return@run null
-                    "127.0.0.1" to httpPort
-                } else {
-                    entry.optString("IPAddr") to
-                        entry.optInt("Port", 80).let { if (it == 0) 80 else it }
-                }
-                OnvifMedia.getStreamUri(
-                    host = soapHost,
-                    port = soapPort,
-                    user = entry.optString("Username", "admin"),
-                    pass = entry.optString("Password", ""),
-                    sub  = (stream == 1),  // 0=main, 1=sub matches our internal convention
-                )
-            }
-            if (onvifUrl != null) {
-                onvifStreamUrlCache[Pair(channelId, stream)] = onvifUrl
-                val routed = if (creds.remote) {
-                    val rtspPort = ensureChannelRtspTunnel(channelId) ?: return null
-                    rewriteUrlHost(onvifUrl, "127.0.0.1", rtspPort)
-                } else onvifUrl
-                return maybeWrapTls(routed, channelId)
-            }
-            android.util.Log.w("NvrViewModel", "ONVIF GetStreamUri failed for ch$channelId — falling back")
+        val resolved = try {
+            api.channelStream(channelId, streamType)
+        } catch (t: Throwable) {
+            android.util.Log.w("NvrViewModel",
+                "publisher /api/channels/$channelId/stream failed: ${t.message}")
+            return null
+        }
+        if (resolved.url.isBlank()) {
+            android.util.Log.w("NvrViewModel",
+                "publisher returned empty URL for ch$channelId (${resolved.error})")
+            return null
         }
 
-        val baseUrl: String = if (!creds.remote) {
-            NetSdkApi.cameraRtspUrl(entry, channelId, stream) ?: return null
-        } else {
+        val routed = if (creds.remote) {
             val rtspPort = ensureChannelRtspTunnel(channelId) ?: return null
-            NetSdkApi.cameraRtspUrlTunneled(entry, channelId, rtspPort, stream)
-        }
+            rewriteUrlHost(resolved.url, "127.0.0.1", rtspPort)
+        } else resolved.url
 
-        return maybeWrapTls(baseUrl, channelId)
+        return maybeWrapTls(routed, channelId)
     }
 
     /** Open (or reuse) the per-channel RTSP libjuice tunnel. Returns its
@@ -302,10 +330,6 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         val tail = url.substring(pathStart)
         return "${url.substring(0, authStart)}${userinfo}${newHost}:${newPort}${tail}"
     }
-
-    // Cache of camera-direct ONVIF GetStreamUri results, keyed by
-    // (channelId, stream). Avoids re-querying the camera on every UI nav.
-    private val onvifStreamUrlCache = ConcurrentHashMap<Pair<Int, Int>, String>()
 
     /** If the URL is `rtsps://`, ensure a per-channel TLS-strip proxy is
      *  running and rewrite to `rtsp://127.0.0.1:<port>/...`. libVLC's
@@ -464,9 +488,35 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 a.setIpCamInfoOne(channelId, obj)
-                ipCamInfoStatus = "Saved channel ${channelId + 1}"
+                ipCamInfoStatus = "Saved channel ${channelId + 1} — waiting for stream URL…"
                 loadIpCamInfo()
                 refreshChannels()
+                // Trigger publisher's discovery immediately + then poll
+                // /api/channels until ch shows up with a non-empty URL.
+                // Bounded at ~10s so a misconfigured camera doesn't hang
+                // the UI; if the channel still isn't resolved by then we
+                // surface a status and onDone() so the user can navigate
+                // (the channel will fill in eventually via the background
+                // refresh tick).
+                val pub = publisher()
+                if (pub != null) {
+                    pub.refresh()
+                    val expectedIp = (edits["IPAddr"] as? String).orEmpty()
+                    var ready = false
+                    for (attempt in 1..10) {
+                        kotlinx.coroutines.delay(1000)
+                        val list = runCatching { pub.channels("sub") }.getOrNull() ?: continue
+                        val match = list.firstOrNull { it.channel == channelId }
+                        if (match != null && match.url.isNotBlank() &&
+                            (expectedIp.isBlank() || match.ip == expectedIp)) {
+                            ready = true
+                            break
+                        }
+                    }
+                    ipCamInfoStatus =
+                        if (ready) "Saved channel ${channelId + 1} — ready to stream"
+                        else "Saved channel ${channelId + 1}. URL still resolving; try Live in a few seconds."
+                }
                 onDone()
             } catch (t: Throwable) {
                 ipCamInfoStatus = "Save failed: ${t.message}"
@@ -629,103 +679,76 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------------
     var ptzStatus by mutableStateOf<String?>(null)
 
-    private val httpTunnelSessions = ConcurrentHashMap<Int, RemoteSession>()
-
-    /** Open (or reuse) the libjuice HTTP tunnel for a channel. Returns its
-     *  localhost port. Only valid in Remote mode. */
-    private suspend fun ensureChannelHttpTunnel(channelId: Int): Int? {
-        val creds = credentials ?: return null
-        if (!creds.remote) return null
-        val existing = httpTunnelSessions[channelId]
-        if (existing != null && existing.isAlive) return existing.localPort
-        // Tear down dead one.
-        existing?.let { runCatching { it.close() } }
-        httpTunnelSessions.remove(channelId)
-
-        val sid = "${creds.deviceId}-c$channelId-http"
-        android.util.Log.i("NvrVM-Ptz", "opening HTTP tunnel for $sid")
-        val ns = RemoteSession(sid, remoteConfig)
-        val ok = ns.connect()
-        if (!ok) {
-            ns.close()
-            android.util.Log.w("NvrVM-Ptz", "HTTP tunnel connect failed for $sid")
-            return null
-        }
-        httpTunnelSessions[channelId] = ns
-        android.util.Log.i("NvrVM-Ptz", "HTTP tunnel ready: $sid -> 127.0.0.1:${ns.localPort}")
-        return ns.localPort
-    }
-
-    /** Build a PtzClient for a given channel. The client uses an http-endpoint
-     *  resolver that returns the camera IP in LAN mode, or the tunneled
-     *  localhost:port in Remote mode. */
+    /** UI-side PTZ capability descriptor for a channel. Doesn't do any
+     *  network work — pure protocol-name heuristic to grey out the pad
+     *  for cams known not to expose PTZ. Publisher remains source of
+     *  truth for actual dispatch. */
     fun ptzClientFor(channelId: Int): PtzClient? {
         val entry = findIpCamEntry(channelId) ?: return null
-        val isRemote = credentials?.remote == true
-        return PtzClient(
-            ipCamEntry = entry,
-            remoteMode = isRemote,
-            httpEndpoint = {
-                if (isRemote) {
-                    val p = ensureChannelHttpTunnel(channelId)
-                    if (p != null) "127.0.0.1" to p else null
-                } else {
-                    val ip = entry.optString("IPAddr")
-                    val port = entry.optInt("Port", 80).let { if (it == 0 || it == 554) 80 else it }
-                    if (ip.isNotBlank()) ip to port else null
-                }
-            }
-        )
+        return PtzClient.fromIpCamEntry(entry)
+    }
+
+    /** Vector for a PTZ direction, in ONVIF's normalised [-1, 1] units.
+     *  Velocity magnitude scales with [speed] (1..8 maps to 0.125..1.0). */
+    private fun ptzVector(dir: PtzClient.Dir, speed: Int): Triple<Double, Double, Double> {
+        val s = (speed.coerceIn(1, 8)) / 8.0
+        return when (dir) {
+            PtzClient.Dir.UP         -> Triple( 0.0,        s,    0.0)
+            PtzClient.Dir.DOWN       -> Triple( 0.0,       -s,    0.0)
+            PtzClient.Dir.LEFT       -> Triple(-s,          0.0,  0.0)
+            PtzClient.Dir.RIGHT      -> Triple( s,          0.0,  0.0)
+            PtzClient.Dir.LEFT_UP    -> Triple(-s,          s,    0.0)
+            PtzClient.Dir.LEFT_DOWN  -> Triple(-s,         -s,    0.0)
+            PtzClient.Dir.RIGHT_UP   -> Triple( s,          s,    0.0)
+            PtzClient.Dir.RIGHT_DOWN -> Triple( s,         -s,    0.0)
+            PtzClient.Dir.ZOOM_IN    -> Triple( 0.0,        0.0,  s)
+            PtzClient.Dir.ZOOM_OUT   -> Triple( 0.0,        0.0, -s)
+        }
     }
 
     fun ptzStart(channelId: Int, dir: PtzClient.Dir, speed: Int = 4) {
         android.util.Log.i("NvrVM-Ptz", "ptzStart ch=$channelId dir=$dir speed=$speed")
-        val ptz = ptzClientFor(channelId)
-        if (ptz == null) { android.util.Log.w("NvrVM-Ptz", "ptzStart: ptzClientFor returned null"); return }
-        if (!ptz.isSupportedInCurrentMode) {
-            android.util.Log.w("NvrVM-Ptz", "ptzStart: unsupported reason='${ptz.unsupportedReason}'")
-            ptzStatus = ptz.unsupportedReason
-            return
-        }
+        val api = publisher()
+        if (api == null) { ptzStatus = "Not logged in"; return }
+        val (pan, tilt, zoom) = ptzVector(dir, speed)
         viewModelScope.launch {
-            val ok = ptz.start(dir, speed)
-            android.util.Log.i("NvrVM-Ptz", "ptzStart ch=$channelId dir=$dir -> ok=$ok")
-            if (!ok) ptzStatus = "PTZ command rejected by camera (auth, no PTZ hw, or wrong IP)"
+            val r = api.ptzMove(channelId, pan, tilt, zoom)
+            android.util.Log.i("NvrVM-Ptz", "ptzStart ch=$channelId dir=$dir -> ok=${r.ok} err=${r.error}")
+            if (!r.ok) {
+                // Publisher returns "camera does not support PTZ (fixed-position model)"
+                // for bullet/fixed-dome and "PTZ not implemented for N1 cams" for N1.
+                ptzStatus = extractError(r.error) ?: "PTZ rejected"
+            }
         }
     }
 
     fun ptzStop(channelId: Int) {
         android.util.Log.i("NvrVM-Ptz", "ptzStop ch=$channelId")
-        val ptz = ptzClientFor(channelId) ?: return
-        if (!ptz.isSupportedInCurrentMode) return
+        val api = publisher() ?: return
         viewModelScope.launch {
-            val ok = ptz.stop()
-            android.util.Log.i("NvrVM-Ptz", "ptzStop ch=$channelId -> ok=$ok")
+            val r = api.ptzStop(channelId)
+            android.util.Log.i("NvrVM-Ptz", "ptzStop ch=$channelId -> ok=${r.ok}")
         }
     }
 
     fun ptzGotoPreset(channelId: Int, preset: Int) {
-        val ptz = ptzClientFor(channelId) ?: return
-        if (!ptz.isSupportedInCurrentMode) {
-            ptzStatus = ptz.unsupportedReason
-            return
-        }
-        viewModelScope.launch {
-            val ok = ptz.gotoPreset(preset)
-            ptzStatus = if (ok) "Recalled preset $preset" else "Preset $preset not set on camera"
-        }
+        // Publisher /api/channels/<n>/ptz currently only supports move + stop.
+        // ONVIF GotoPreset is a separate SOAP call; will be added in a
+        // follow-up. Surface a clean status so the UI doesn't dangle.
+        ptzStatus = "Presets not yet wired to NVR dispatcher (preset $preset)"
     }
 
     fun ptzSetPreset(channelId: Int, preset: Int) {
-        val ptz = ptzClientFor(channelId) ?: return
-        if (!ptz.isSupportedInCurrentMode) {
-            ptzStatus = ptz.unsupportedReason
-            return
-        }
-        viewModelScope.launch {
-            val ok = ptz.setPreset(preset)
-            ptzStatus = if (ok) "Saved preset $preset" else "Failed to save preset $preset"
-        }
+        ptzStatus = "Presets not yet wired to NVR dispatcher (preset $preset)"
+    }
+
+    /** Pull the human-readable bit out of the publisher's JSON error.
+     *  e.g. `{"error":"camera does not support PTZ ..."}` → "camera does..." */
+    private fun extractError(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        return try {
+            JSONObject(raw).optString("error", raw)
+        } catch (_: Throwable) { raw }
     }
 
     // ------------------------------------------------------------------
@@ -737,6 +760,9 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     var smtpCfg by mutableStateOf<JSONObject?>(null)
     var wifiCfg by mutableStateOf<JSONObject?>(null)
     var encodeCfg by mutableStateOf<JSONArray?>(null)
+    var localTimeRaw by mutableStateOf<String?>(null)
+    var generalTimeCfg by mutableStateOf<JSONObject?>(null)
+    var generalMaintCfg by mutableStateOf<JSONObject?>(null)
     var settingStatus by mutableStateOf<String?>(null)
 
     fun loadOrdinary() = launchBlock({ api?.deviceInfo() }) {
@@ -764,6 +790,82 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         launchSave({ api?.reboot() }, "Reboot sent") {}
     fun testSmtp() =
         launchSave({ api?.smtpTest() }, "Test mail sent") {}
+
+    // ---- Time / Date -------------------------------------------------------
+    fun loadGeneralTime() = launchBlock({ api?.generalTime() }) { generalTimeCfg = it }
+    fun saveGeneralTime(updated: JSONObject) =
+        launchSave({ api?.setGeneralTime(updated) }, "Time saved") { loadGeneralTime() }
+
+    // ---- Scheduled Maintenance --------------------------------------------
+    fun loadGeneralMaint() = launchBlock({ api?.generalMaintenance() }) { generalMaintCfg = it }
+    fun saveGeneralMaint(updated: JSONObject) =
+        launchSave({ api?.setGeneralMaintenance(updated) }, "Maintenance schedule saved") { loadGeneralMaint() }
+
+    // ---- Change password ---------------------------------------------------
+    /** Posts to /netsdk/SetPasswd. NVR firmware expects User/OldPasswd/NewPasswd. */
+    fun changePassword(user: String, oldPwd: String, newPwd: String, onDone: (Boolean) -> Unit) {
+        val a = api ?: run { settingStatus = "Not connected"; onDone(false); return }
+        settingStatus = "Updating password…"
+        viewModelScope.launch {
+            try {
+                val body = JSONObject().apply {
+                    put("User", user)
+                    put("OldPasswd", oldPwd)
+                    put("NewPasswd", newPwd)
+                }
+                a.setPasswd(body)
+                settingStatus = "Password updated"
+                onDone(true)
+            } catch (t: Throwable) {
+                settingStatus = "Update failed: ${t.message}"
+                onDone(false)
+            }
+        }
+    }
+
+    // ---- Image / Color -----------------------------------------------------
+    // Per-channel image settings now route through the publisher's
+    // /api/channels/{n}/image endpoint, which translates to ONVIF SOAP against
+    // the actual camera (not the NVR's local table). Verified 2026-06-02 end-to-end
+    // against CP Plus (ONVIF :80) + Adiance AD-90 (ONVIF :8888).
+    //
+    // We keep one JSONObject per channel (channelId → settings).
+    var perChannelColor by mutableStateOf<Map<Int, JSONObject>>(emptyMap())
+
+    fun loadColorFor(channelId: Int) {
+        viewModelScope.launch {
+            try {
+                val pub = publisher() ?: run {
+                    settingStatus = "Publisher unreachable"
+                    return@launch
+                }
+                val obj = pub.imageGet(channelId)
+                perChannelColor = perChannelColor.toMutableMap().apply { put(channelId, obj) }
+            } catch (t: NetSdkException) {
+                settingStatus = "Camera ${channelId + 1} image read failed: HTTP ${t.httpCode}"
+            } catch (t: Throwable) {
+                settingStatus = "Camera ${channelId + 1} image read failed: ${t.message}"
+            }
+        }
+    }
+
+    fun saveColorFor(channelId: Int, settings: JSONObject) {
+        viewModelScope.launch {
+            try {
+                val pub = publisher() ?: run {
+                    settingStatus = "Publisher unreachable"
+                    return@launch
+                }
+                val echoed = pub.imageSet(channelId, settings)
+                perChannelColor = perChannelColor.toMutableMap().apply { put(channelId, echoed) }
+                settingStatus = "Camera ${channelId + 1} image saved"
+            } catch (t: NetSdkException) {
+                settingStatus = "Camera ${channelId + 1} image save failed: HTTP ${t.httpCode} — ${t.responseBody.take(120)}"
+            } catch (t: Throwable) {
+                settingStatus = "Camera ${channelId + 1} image save failed: ${t.message}"
+            }
+        }
+    }
 
     private fun <T> launchBlock(load: suspend () -> T?, onValue: (T) -> Unit) {
         viewModelScope.launch {

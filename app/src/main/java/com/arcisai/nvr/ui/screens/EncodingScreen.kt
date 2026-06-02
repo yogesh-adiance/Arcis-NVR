@@ -26,6 +26,7 @@ private val RES_OPTIONS     = listOf("2560x1440","2304x1296","1920x1080","1280x7
 @Composable
 fun EncodingScreen(vm: NvrViewModel, onBack: () -> Unit) {
     LaunchedEffect(Unit) { vm.loadEncode() }
+    val snack = rememberSettingsSnackbar(vm.settingStatus)
 
     Scaffold(
         topBar = {
@@ -38,6 +39,7 @@ fun EncodingScreen(vm: NvrViewModel, onBack: () -> Unit) {
                 },
             )
         },
+        snackbarHost = { SnackbarHost(snack) },
     ) { padding ->
         val arr = vm.encodeCfg
         Column(modifier = Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState())) {

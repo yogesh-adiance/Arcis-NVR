@@ -15,6 +15,8 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.*
@@ -25,6 +27,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.arcisai.nvr.viewmodel.NvrViewModel
@@ -423,6 +426,7 @@ private fun EditIpcDialog(
     ) }
     var username by remember { mutableStateOf(initial.optString("Username", "admin")) }
     var password by remember { mutableStateOf(initial.optString("Password")) }
+    var pwdVisible by remember { mutableStateOf(false) }
     var model    by remember { mutableStateOf(initial.optString("Modelname")) }
     var enable   by remember { mutableStateOf(initial.optString("Enable") == "True") }
     var rtspUrl  by remember { mutableStateOf(initial.optString("RtspUrl")) }
@@ -497,9 +501,17 @@ private fun EditIpcDialog(
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = password, onValueChange = { password = it },
                     label = { Text("Password") }, singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
+                    visualTransformation = if (pwdVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    trailingIcon = {
+                        IconButton(onClick = { pwdVisible = !pwdVisible }) {
+                            Icon(
+                                imageVector = if (pwdVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                contentDescription = if (pwdVisible) "Hide password" else "Show password",
+                            )
+                        }
+                    })
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = model, onValueChange = { model = it },
                     label = { Text("Model name (optional)") }, singleLine = true,
@@ -537,6 +549,7 @@ private fun AddThirdPartyDialog(
     var port     by remember { mutableStateOf("554") }
     var username by remember { mutableStateOf("admin") }
     var password by remember { mutableStateOf("") }
+    var pwdVisible by remember { mutableStateOf(false) }
     var model    by remember { mutableStateOf("") }
     var rtspUrl  by remember { mutableStateOf("") }
     var slotId   by remember { mutableStateOf(firstEmptySlot(slots) ?: 0) }
@@ -615,9 +628,17 @@ private fun AddThirdPartyDialog(
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = password, onValueChange = { password = it },
                     label = { Text("Password") }, singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
+                    visualTransformation = if (pwdVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    trailingIcon = {
+                        IconButton(onClick = { pwdVisible = !pwdVisible }) {
+                            Icon(
+                                imageVector = if (pwdVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                contentDescription = if (pwdVisible) "Hide password" else "Show password",
+                            )
+                        }
+                    })
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = model, onValueChange = { model = it },
                     label = { Text("Model name (optional)") }, singleLine = true,

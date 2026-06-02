@@ -18,13 +18,22 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.arcisai.nvr.ui.Tab
+import com.arcisai.nvr.ui.screens.DeviceInfoScreen
 import com.arcisai.nvr.ui.screens.EncodingScreen
+import com.arcisai.nvr.ui.screens.GeneralScreen
+import com.arcisai.nvr.ui.screens.ImageColorScreen
 import com.arcisai.nvr.ui.screens.LiveScreen
 import com.arcisai.nvr.ui.screens.LiveTabScreen
 import com.arcisai.nvr.ui.screens.LoginScreen
+import com.arcisai.nvr.ui.screens.MaintenanceScreen
 import com.arcisai.nvr.ui.screens.ManageScreen
+import com.arcisai.nvr.ui.screens.NetworkScreen
+import com.arcisai.nvr.ui.screens.PasswordScreen
 import com.arcisai.nvr.ui.screens.PlaybackTabScreen
 import com.arcisai.nvr.ui.screens.SettingsHubScreen
+import com.arcisai.nvr.ui.screens.SmtpScreen
+import com.arcisai.nvr.ui.screens.TimeScreen
+import com.arcisai.nvr.ui.screens.WifiScreen
 import com.arcisai.nvr.ui.theme.ArcisNvrTheme
 import com.arcisai.nvr.viewmodel.NvrViewModel
 
@@ -91,7 +100,16 @@ private fun MainScaffold(vm: NvrViewModel, onLogout: () -> Unit) {
             }
             composable("settings/{key}") { entry ->
                 when (entry.arguments?.getString("key")) {
-                    "encode" -> EncodingScreen(vm, onBack = { nav.popBackStack() })
+                    "encode"   -> EncodingScreen(vm, onBack = { nav.popBackStack() })
+                    "device"   -> DeviceInfoScreen(vm, onBack = { nav.popBackStack() })
+                    "general"  -> GeneralScreen(vm, onBack = { nav.popBackStack() })
+                    "network"  -> NetworkScreen(vm, onBack = { nav.popBackStack() })
+                    "smtp"     -> SmtpScreen(vm, onBack = { nav.popBackStack() })
+                    "wifi"     -> WifiScreen(vm, onBack = { nav.popBackStack() })
+                    "time"     -> TimeScreen(vm, onBack = { nav.popBackStack() })
+                    "maint"    -> MaintenanceScreen(vm, onBack = { nav.popBackStack() })
+                    "password" -> PasswordScreen(vm, onBack = { nav.popBackStack() })
+                    "color"    -> ImageColorScreen(vm, onBack = { nav.popBackStack() })
                     else -> SettingsHubScreen(
                         onPick = { key -> nav.navigate("settings/$key") },
                         onLogout = onLogout,

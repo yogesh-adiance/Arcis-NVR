@@ -126,9 +126,14 @@ class NetSdkApi(val creds: NvrCredentials) {
     suspend fun general(): JSONObject = getJson("/netsdk/General")
     suspend fun setGeneral(body: JSONObject): String = put("/netsdk/General", body.toString())
     suspend fun deviceInfo(): JSONObject = getJson("/netsdk/Stat/DeviceInfo")
-    suspend fun localTime(): String = get("/netsdk/LocalTime")
-    suspend fun utcTime(): String = get("/netsdk/UtcTime")
-    suspend fun setLocalTime(body: String): String = put("/netsdk/S.SetLocalTime", body)
+    // Verified against firmware 3.6.6.20TestF: time + NTP + SummerTime live under
+    // /netsdk/General/Time, NOT /netsdk/LocalTime (that path returns "Save failure" stub).
+    suspend fun generalTime(): JSONObject = getJson("/netsdk/General/Time")
+    suspend fun setGeneralTime(body: JSONObject): String =
+        put("/netsdk/General/Time", body.toString())
+    suspend fun generalMaintenance(): JSONObject = getJson("/netsdk/General/Maintenance")
+    suspend fun setGeneralMaintenance(body: JSONObject): String =
+        put("/netsdk/General/Maintenance", body.toString())
 
     suspend fun maxChannels(): Int =
         deviceInfo().optString("MAX_CHN").toIntOrNull()?.takeIf { it in 1..32 } ?: 4
