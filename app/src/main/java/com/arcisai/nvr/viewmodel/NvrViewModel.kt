@@ -9,6 +9,12 @@ import androidx.lifecycle.viewModelScope
 import com.arcisai.nvr.data.ChannelCache
 import com.arcisai.nvr.data.CredentialStore
 import com.arcisai.nvr.data.NvrCredentials
+import com.arcisai.nvr.net.AESEncryption
+import com.arcisai.nvr.net.AbdDto
+import com.arcisai.nvr.net.AddAbdRequest
+import com.arcisai.nvr.net.BackendApi
+import com.arcisai.nvr.net.GetAbdRequest
+import com.arcisai.nvr.net.LoginRequest
 import com.arcisai.nvr.net.NetSdkApi
 import com.arcisai.nvr.net.NetSdkException
 import com.arcisai.nvr.net.OnvifDiscovery
@@ -38,6 +44,8 @@ data class ChannelInfo(
 class NvrViewModel(app: Application) : AndroidViewModel(app) {
     private val store = CredentialStore(app)
     private val cache = ChannelCache(app)
+    // Lazy: created on first cloud login.
+    private val cloudApi: BackendApi by lazy { BackendApi.create(app) }
 
     var credentials by mutableStateOf<NvrCredentials?>(null)
         private set
@@ -47,6 +55,25 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     // Login screen state
     var loginStatus by mutableStateOf<String?>(null)
     var loginBusy by mutableStateOf(false)
+
+    // ---- Arcis cloud (Remote-mode account) state -------------------------
+    /** Whether the user has a usable cookie session against dev.arcisai.io. */
+    var accountSignedIn by mutableStateOf(false)
+        private set
+    /** Friendly name + email of the currently signed-in cloud user. */
+    var accountName  by mutableStateOf<String?>(null)
+        private set
+    var accountEmail by mutableStateOf<String?>(null)
+        private set
+    /** The list of ABDs (NVRs) the user owns, last-fetched. */
+    var myAbds by mutableStateOf<List<AbdDto>>(emptyList())
+        private set
+    var abdListLoading by mutableStateOf(false)
+        private set
+    var abdListError by mutableStateOf<String?>(null)
+        private set
+    /** Status message shown on Login + My-NVRs screens (snackbar-style). */
+    var accountStatus by mutableStateOf<String?>(null)
 
     // Channels list (Home screen)
     var channels by mutableStateOf<List<ChannelInfo>>(emptyList())
@@ -179,6 +206,30 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun logout() {
+        releaseSelectedNvrLocal()
+
+        // Clear cloud session too (best-effort GET /auth/logout + drop cookie).
+        viewModelScope.launch {
+            runCatching { cloudApi.logout() }
+            BackendApi.cookieJarInstance?.clear()
+        }
+        accountSignedIn = false
+        accountName = null
+        accountEmail = null
+        myAbds = emptyList()
+        abdListError = null
+    }
+
+    /**
+     * Drop the currently-selected NVR (close P2P tunnels, forget creds,
+     * clear cached channel data) but keep the cloud account session so the
+     * UI can return to MyNvrsScreen and pick a different ABD.
+     */
+    fun releaseSelectedNvr() {
+        releaseSelectedNvrLocal()
+    }
+
+    private fun releaseSelectedNvrLocal() {
         sessions.values.forEach { runCatching { it.close() } }
         sessions.clear()
         tlsProxies.values.forEach { runCatching { it.close() } }
@@ -193,6 +244,146 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         channels = emptyList()
         ipCamInfo = null
         remoteStatus = null
+    }
+
+    // ---- Arcis cloud (Remote-mode account flow) --------------------------
+    /** Login against dev.arcisai.io. On success the HTTP-only `token` cookie
+     *  is auto-persisted by [PersistentCookieStore] so the session survives
+     *  app restart; `onSuccess` is called so the UI can route to MyNvrsScreen. */
+    fun accountLogin(email: String, password: String, onSuccess: () -> Unit) {
+        if (loginBusy) return
+        loginBusy = true
+        loginStatus = null
+        viewModelScope.launch {
+            try {
+                // Backend AES-CBC-decrypts the password with a shared key/IV
+                // (see AESEncryption + Arcis_Main_Backend/authController.js).
+                // Sending plaintext fails the length-24 sanity check inside
+                // decryptPassword and lands us on the "wrong password" branch.
+                val enc = AESEncryption.encrypt(password)
+                val resp = cloudApi.login(LoginRequest(email = email, password = enc))
+                if (!resp.success) {
+                    loginStatus = resp.data ?: resp.message ?: "Login failed"
+                    return@launch
+                }
+                accountSignedIn = true
+                accountName  = resp.name
+                accountEmail = resp.email ?: email
+                onSuccess()
+            } catch (t: Throwable) {
+                loginStatus = friendlyHttpError(t)
+            } finally {
+                loginBusy = false
+            }
+        }
+    }
+
+    /** Try to resume an existing cloud session by hitting /abd/getAbd with the
+     *  persisted cookie. If it succeeds, we know the cookie is still valid and
+     *  can skip the email/password form on app launch. */
+    fun resumeAccountSessionIfAny(onResumed: () -> Unit) {
+        viewModelScope.launch {
+            try {
+                val resp = cloudApi.getAbd()
+                if (resp.success) {
+                    accountSignedIn = true
+                    myAbds = resp.data
+                    onResumed()
+                }
+            } catch (_: Throwable) {
+                // No valid session — user has to log in again.
+            }
+        }
+    }
+
+    fun loadAbds() {
+        if (abdListLoading) return
+        abdListLoading = true
+        abdListError = null
+        viewModelScope.launch {
+            try {
+                val resp = cloudApi.getAbd()
+                if (!resp.success) {
+                    abdListError = resp.message ?: "Couldn't load NVR list"
+                    return@launch
+                }
+                myAbds = resp.data
+            } catch (t: Throwable) {
+                abdListError = friendlyHttpError(t)
+            } finally {
+                abdListLoading = false
+            }
+        }
+    }
+
+    /** POST /api/abd/addAbd. Backend validates against EMS so a bad deviceId
+     *  comes back as a 404 with a clear message. */
+    fun addAbd(name: String, deviceId: String, onResult: (ok: Boolean, msg: String) -> Unit) {
+        viewModelScope.launch {
+            try {
+                val resp = cloudApi.addAbd(AddAbdRequest(name = name.trim(), deviceId = deviceId.trim()))
+                if (resp.success) {
+                    loadAbds()
+                    onResult(true, resp.message ?: "NVR added")
+                } else {
+                    onResult(false, resp.message ?: "Failed to add NVR")
+                }
+            } catch (t: Throwable) {
+                onResult(false, friendlyHttpError(t))
+            }
+        }
+    }
+
+    /** User picked an ABD on the MyNvrsScreen — open the P2P tunnel to it and
+     *  jump into the main app. Re-uses the existing remote login path. */
+    fun selectAbd(abd: AbdDto, onSuccess: () -> Unit) {
+        val email = accountEmail ?: ""
+        val creds = NvrCredentials(
+            host = "",
+            port = 80,
+            username = "admin",   // NVR-local auth still admin/empty (publisher's basic gate)
+            password = "",
+            remote = true,
+            deviceId = abd.deviceId,
+            accountEmail = email,
+            accountName  = accountName ?: "",
+            accountAbdName = abd.name,
+        )
+        login(creds, onSuccess)
+    }
+
+    /**
+     * Surfaces the backend's actual error text instead of guessing from the
+     * HTTP status code. The Arcis backend mixes two field names — `data` on
+     * auth endpoints, `message` on ABD endpoints — so try both. Only fall back
+     * to a generic message when we genuinely can't read the body (network
+     * error, garbage response, etc).
+     */
+    private fun friendlyHttpError(t: Throwable): String {
+        if (t is retrofit2.HttpException) {
+            val body = runCatching { t.response()?.errorBody()?.string().orEmpty() }
+                .getOrDefault("")
+            if (body.isNotBlank()) {
+                val parsed = runCatching {
+                    val j = JSONObject(body)
+                    j.optString("message").ifBlank { j.optString("data") }
+                }.getOrNull()
+                if (!parsed.isNullOrBlank()) return parsed
+            }
+            return when (t.code()) {
+                401 -> "Session expired — please sign in again"
+                404 -> "Not found"
+                in 500..599 -> "Server error (${t.code()}) — try again later"
+                else -> "Request failed (${t.code()})"
+            }
+        }
+        val raw = t.message.orEmpty()
+        return when {
+            raw.contains("UnknownHostException") || raw.contains("ConnectException") ->
+                "Couldn't reach dev.arcisai.io — check internet"
+            raw.contains("SocketTimeoutException") -> "Connection timed out"
+            else -> raw.ifBlank { "Network error" }
+        }
     }
 
     // Per-channel TLS-strip proxies for cameras whose RTSP is TLS-only

@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavController
@@ -27,6 +28,7 @@ import com.arcisai.nvr.ui.screens.LiveTabScreen
 import com.arcisai.nvr.ui.screens.LoginScreen
 import com.arcisai.nvr.ui.screens.MaintenanceScreen
 import com.arcisai.nvr.ui.screens.ManageScreen
+import com.arcisai.nvr.ui.screens.MyNvrsScreen
 import com.arcisai.nvr.ui.screens.NetworkScreen
 import com.arcisai.nvr.ui.screens.PasswordScreen
 import com.arcisai.nvr.ui.screens.PlaybackTabScreen
@@ -48,22 +50,74 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background) {
                     val rootNav = rememberNavController()
-                    val startRoute = if (viewModel.credentials != null) "main" else "login"
-                    NavHost(navController = rootNav, startDestination = startRoute) {
-                        composable("login") {
-                            LoginScreen(viewModel) {
-                                rootNav.navigate("main") {
+                    val startRoute = when {
+                        // Already wired into a specific NVR (any mode) → go straight in.
+                        viewModel.credentials != null -> "main"
+                        // Have a persisted cloud session but no NVR picked yet → ask.
+                        viewModel.accountSignedIn    -> "my_nvrs"
+                        else                          -> "login"
+                    }
+                    // Best-effort: resume cloud session on first launch so a
+                    // returning user lands directly on MyNvrsScreen.
+                    LaunchedEffect(Unit) {
+                        if (viewModel.credentials == null && !viewModel.accountSignedIn) {
+                            viewModel.resumeAccountSessionIfAny {
+                                rootNav.navigate("my_nvrs") {
                                     popUpTo("login") { inclusive = true }
                                 }
                             }
                         }
+                    }
+                    NavHost(navController = rootNav, startDestination = startRoute) {
+                        composable("login") {
+                            LoginScreen(
+                                vm = viewModel,
+                                onLanConnected = {
+                                    rootNav.navigate("main") {
+                                        popUpTo("login") { inclusive = true }
+                                    }
+                                },
+                                onCloudAuthenticated = {
+                                    rootNav.navigate("my_nvrs") {
+                                        popUpTo("login") { inclusive = true }
+                                    }
+                                },
+                            )
+                        }
+                        composable("my_nvrs") {
+                            MyNvrsScreen(
+                                vm = viewModel,
+                                onNvrSelected = {
+                                    rootNav.navigate("main") {
+                                        popUpTo("my_nvrs") { inclusive = true }
+                                    }
+                                },
+                                onLogout = {
+                                    viewModel.logout()
+                                    rootNav.navigate("login") {
+                                        popUpTo("my_nvrs") { inclusive = true }
+                                    }
+                                },
+                            )
+                        }
                         composable("main") {
-                            MainScaffold(viewModel) {
-                                viewModel.logout()
-                                rootNav.navigate("login") {
-                                    popUpTo("main") { inclusive = true }
-                                }
-                            }
+                            MainScaffold(
+                                vm = viewModel,
+                                onLogout = {
+                                    viewModel.logout()
+                                    rootNav.navigate("login") {
+                                        popUpTo("main") { inclusive = true }
+                                    }
+                                },
+                                onSwitchNvr = if (viewModel.accountSignedIn) {
+                                    {
+                                        viewModel.releaseSelectedNvr()
+                                        rootNav.navigate("my_nvrs") {
+                                            popUpTo("main") { inclusive = true }
+                                        }
+                                    }
+                                } else null,
+                            )
                         }
                     }
                 }
@@ -73,7 +127,11 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun MainScaffold(vm: NvrViewModel, onLogout: () -> Unit) {
+private fun MainScaffold(
+    vm: NvrViewModel,
+    onLogout: () -> Unit,
+    onSwitchNvr: (() -> Unit)?,
+) {
     val nav = rememberNavController()
     Scaffold(
         bottomBar = { BottomTabBar(nav) },
@@ -96,6 +154,9 @@ private fun MainScaffold(vm: NvrViewModel, onLogout: () -> Unit) {
                 SettingsHubScreen(
                     onPick = { key -> nav.navigate("settings/$key") },
                     onLogout = onLogout,
+                    onSwitchNvr = onSwitchNvr,
+                    currentNvrName = vm.credentials?.accountAbdName?.ifBlank { vm.credentials?.deviceId },
+                    accountEmail = vm.accountEmail,
                 )
             }
             composable("settings/{key}") { entry ->
