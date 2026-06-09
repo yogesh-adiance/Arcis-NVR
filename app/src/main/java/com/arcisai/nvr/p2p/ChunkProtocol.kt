@@ -19,9 +19,14 @@ import java.util.concurrent.atomic.AtomicInteger
  * buffer of `total_size` bytes and emitted when all offsets have been filled.
  */
 object ChunkProtocol {
-    // Match the NVR-side provider's MAX_UDP_PAYLOAD. Reduced from 1100 to 500
-    // because Indian carrier 5G LTE caps path MTU below ~1100 + IP/UDP headers,
-    // and libjuice sets IP_DONTFRAG (kernel returns EMSGSIZE on oversized UDP).
+    // MUST equal the DEPLOYED provider's MAX_UDP_PAYLOAD. Verified from live
+    // logcat 2026-06-06: the device (ABD-400289-RYNA) sends 500-byte chunks
+    // (payload 484 — onRecv shows off=0/484/968/1452), so its MAX_UDP_PAYLOAD
+    // is 500, NOT the 1100 in the nvr-cloud-platform source tree (that source is
+    // stale vs. what's flashed). The provider indexes app→provider chunks as
+    // `chunk_index = offset / 484`, so the app MUST send 484-byte chunks too —
+    // any other size misaligns the indices and large app→provider messages
+    // never reassemble. (1100 was tried and reverted: it broke this direction.)
     const val MAX_UDP_PAYLOAD = 500
     const val HEADER_SIZE     = 16
     const val MAX_CHUNK       = MAX_UDP_PAYLOAD - HEADER_SIZE   // 484

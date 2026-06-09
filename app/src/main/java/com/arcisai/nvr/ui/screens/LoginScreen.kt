@@ -1,5 +1,6 @@
 package com.arcisai.nvr.ui.screens
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -28,19 +29,36 @@ import com.arcisai.nvr.data.NvrCredentials
 import com.arcisai.nvr.ui.theme.AccentPurple
 import com.arcisai.nvr.ui.theme.loginGradient
 import com.arcisai.nvr.viewmodel.NvrViewModel
-import androidx.compose.foundation.Image
-import androidx.compose.ui.unit.Dp
 
+/**
+ * Two flows on this screen:
+ *   - LAN:    direct NVR IP + admin credentials → straight into the main app
+ *   - Remote: Arcis cloud account (email/password) → MyNvrsScreen → pick NVR
+ *
+ * The Remote path's `onCloudAuth` lambda is what MainActivity uses to route
+ * to the My-NVRs picker; the LAN path uses `onLanConnected` for the existing
+ * direct-to-main flow.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LoginScreen(vm: NvrViewModel, onSuccess: () -> Unit) {
+fun LoginScreen(
+    vm: NvrViewModel,
+    onLanConnected: () -> Unit,
+    onCloudAuthenticated: () -> Unit,
+) {
     var remote      by remember { mutableStateOf(false) }
-    var host        by remember { mutableStateOf("192.168.12.253") }
-    var deviceId    by remember { mutableStateOf("ABD-400289-RYNA") }
+
+    // LAN form state
+    var host        by remember { mutableStateOf("") }
     var port        by remember { mutableStateOf("80") }
-    var user        by remember { mutableStateOf("admin") }
-    var pass        by remember { mutableStateOf("") }
-    var passVisible by remember { mutableStateOf(false) }
+    var lanUser     by remember { mutableStateOf("admin") }
+    var lanPass     by remember { mutableStateOf("") }
+    var lanPassVis  by remember { mutableStateOf(false) }
+
+    // Cloud (remote) form state
+    var email       by remember { mutableStateOf("") }
+    var pwd         by remember { mutableStateOf("") }
+    var pwdVis      by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier.fillMaxSize().background(loginGradient()),
@@ -67,42 +85,49 @@ fun LoginScreen(vm: NvrViewModel, onSuccess: () -> Unit) {
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     Text(
-                        if (remote) "Remote (P2P)" else "On this Wi-Fi",
+                        if (remote) "Sign in" else "On this Wi-Fi",
                         fontWeight = FontWeight.SemiBold,
                         fontSize = 18.sp,
                     )
                     Text(
-                        if (remote) "Connect over the internet using the device ID printed on the NVR."
-                        else "Enter the NVR's IP address (it's on the box's LCD or your router's clients list).",
+                        if (remote)
+                            "Use your Arcis account. After signing in you'll see every NVR linked to your account."
+                        else
+                            "Enter the NVR's IP address (printed on the box's LCD or shown on your router's clients list).",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
 
                     SegmentedTabs(
-                        items = listOf("LAN", "Remote (P2P)"),
+                        items = listOf("LAN", "Remote (Account)"),
                         selectedIndex = if (remote) 1 else 0,
-                        onSelect = { idx ->
-                            val next = (idx == 1)
-                            if (next != remote) {
-                                // Errors/status belong to the tab they happened on —
-                                // drop them so a P2P failure doesn't linger on LAN
-                                // (and vice-versa) after switching.
-                                vm.loginStatus = null
-                                vm.remoteStatus = null
-                            }
-                            remote = next
-                        },
+                        onSelect = { remote = (it == 1) },
                         modifier = Modifier.fillMaxWidth(),
                     )
 
                     if (remote) {
                         OutlinedTextField(
-                            value = deviceId, onValueChange = { deviceId = it.trim() },
-                            label = { Text("Device ID") },
-                            supportingText = { Text("e.g. ABD-400289-RYNA") },
-                            singleLine = true,
+                            value = email, onValueChange = { email = it.trim() },
+                            label = { Text("Email") }, singleLine = true,
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                        )
+                        OutlinedTextField(
+                            value = pwd, onValueChange = { pwd = it },
+                            label = { Text("Password") }, singleLine = true,
+                            visualTransformation = if (pwdVis) VisualTransformation.None else PasswordVisualTransformation(),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            trailingIcon = {
+                                IconButton(onClick = { pwdVis = !pwdVis }) {
+                                    Icon(
+                                        imageVector = if (pwdVis) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                        contentDescription = if (pwdVis) "Hide password" else "Show password",
+                                    )
+                                }
+                            },
                         )
                     } else {
                         OutlinedTextField(
@@ -119,30 +144,29 @@ fun LoginScreen(vm: NvrViewModel, onSuccess: () -> Unit) {
                             modifier = Modifier.fillMaxWidth(),
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         )
+                        OutlinedTextField(
+                            value = lanUser, onValueChange = { lanUser = it },
+                            label = { Text("Username") }, singleLine = true,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = lanPass, onValueChange = { lanPass = it },
+                            label = { Text("Password") }, singleLine = true,
+                            visualTransformation = if (lanPassVis) VisualTransformation.None else PasswordVisualTransformation(),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            trailingIcon = {
+                                IconButton(onClick = { lanPassVis = !lanPassVis }) {
+                                    Icon(
+                                        imageVector = if (lanPassVis) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                        contentDescription = if (lanPassVis) "Hide password" else "Show password",
+                                    )
+                                }
+                            },
+                        )
                     }
-
-                    OutlinedTextField(
-                        value = user, onValueChange = { user = it },
-                        label = { Text("Username") }, singleLine = true,
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    OutlinedTextField(
-                        value = pass, onValueChange = { pass = it },
-                        label = { Text("Password") }, singleLine = true,
-                        visualTransformation = if (passVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        trailingIcon = {
-                            IconButton(onClick = { passVisible = !passVisible }) {
-                                Icon(
-                                    imageVector = if (passVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                    contentDescription = if (passVisible) "Hide password" else "Show password",
-                                )
-                            }
-                        },
-                    )
 
                     vm.loginStatus?.let {
                         Text(it, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
@@ -154,19 +178,22 @@ fun LoginScreen(vm: NvrViewModel, onSuccess: () -> Unit) {
                     Spacer(Modifier.height(4.dp))
                     Button(
                         onClick = {
-                            val p = port.toIntOrNull() ?: 80
-                            val creds = if (remote) {
-                                NvrCredentials(host = "", port = 80,
-                                    username = user, password = pass,
-                                    remote = true, deviceId = deviceId)
+                            if (remote) {
+                                vm.accountLogin(email, pwd, onCloudAuthenticated)
                             } else {
-                                NvrCredentials(host = host, port = p,
-                                    username = user, password = pass)
+                                val p = port.toIntOrNull() ?: 80
+                                val creds = NvrCredentials(
+                                    host = host, port = p,
+                                    username = lanUser, password = lanPass,
+                                    remote = false,
+                                )
+                                vm.login(creds, onLanConnected)
                             }
-                            vm.login(creds) { onSuccess() }
                         },
-                        enabled = !vm.loginBusy && user.isNotBlank()
-                            && (if (remote) deviceId.isNotBlank() else host.isNotBlank()),
+                        enabled = !vm.loginBusy && (
+                            if (remote) email.isNotBlank() && pwd.isNotBlank()
+                            else lanUser.isNotBlank() && host.isNotBlank()
+                        ),
                         shape = RoundedCornerShape(14.dp),
                         modifier = Modifier.fillMaxWidth().height(52.dp),
                     ) {
@@ -177,7 +204,11 @@ fun LoginScreen(vm: NvrViewModel, onSuccess: () -> Unit) {
                                 color = MaterialTheme.colorScheme.onPrimary,
                             )
                         } else {
-                            Text("Connect", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                            Text(
+                                if (remote) "Sign in" else "Connect",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp,
+                            )
                         }
                     }
                 }
@@ -213,6 +244,7 @@ private fun BrandHeader() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SegmentedTabs(
     items: List<String>,

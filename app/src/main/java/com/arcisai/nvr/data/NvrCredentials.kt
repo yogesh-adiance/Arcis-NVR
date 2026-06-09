@@ -14,12 +14,19 @@ import androidx.security.crypto.MasterKey
  * `Protocolname` on each IPCamInfo entry (N1 / ONVIF / RTSP / HIKVISION / DAHUA).
  */
 data class NvrCredentials(
-    val host: String,           // LAN IP, e.g. "192.168.12.254"  (ignored in Remote mode)
+    val host: String,                 // LAN IP, e.g. "192.168.12.254" (ignored in Remote mode)
     val port: Int = 80,
-    val username: String,       // typically "admin"
-    val password: String,       // can be blank
+    val username: String,             // typically "admin" (NVR-local) or the user's email in Remote
+    val password: String,             // can be blank
     val remote: Boolean = false,
-    val deviceId: String = "",  // service_id like "ABD-400289-RYNA"
+    val deviceId: String = "",        // service_id like "ABD-400289-RYNA"
+    // ---- Remote-mode account context (Arcis cloud backend) ----
+    // When `remote` is true and `accountEmail` is non-empty the app is
+    // authenticated against the Arcis cloud (HTTP-only cookie session).
+    // `deviceId` is the user-selected ABD from /api/abd/getAbd.
+    val accountEmail: String = "",
+    val accountName: String  = "",
+    val accountAbdName: String = "",  // friendly NVR name (from ABD doc)
 )
 
 class CredentialStore(ctx: Context) {
@@ -40,6 +47,9 @@ class CredentialStore(ctx: Context) {
             .putString("pass", c.password)
             .putBoolean("remote", c.remote)
             .putString("device_id", c.deviceId)
+            .putString("account_email", c.accountEmail)
+            .putString("account_name", c.accountName)
+            .putString("account_abd_name", c.accountAbdName)
             .apply()
     }
 
@@ -52,6 +62,9 @@ class CredentialStore(ctx: Context) {
             password = prefs.getString("pass", "") ?: "",
             remote = prefs.getBoolean("remote", false),
             deviceId = prefs.getString("device_id", "") ?: "",
+            accountEmail = prefs.getString("account_email", "") ?: "",
+            accountName  = prefs.getString("account_name", "") ?: "",
+            accountAbdName = prefs.getString("account_abd_name", "") ?: "",
         )
     }
 

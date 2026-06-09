@@ -96,8 +96,13 @@ fun LiveScreen(viewModel: NvrViewModel, channelId: Int, onBack: () -> Unit) {
                 actions = {
                     if (ptzClient != null) {
                         IconButton(onClick = {
-                            if (ptzAvailable) ptzOpen = !ptzOpen
-                            else viewModel.ptzStatus = ptzReason
+                            when {
+                                !ptzAvailable ->
+                                    viewModel.ptzPopupMessage = ptzReason ?: "This camera has no PTZ."
+                                channelId in viewModel.ptzUnsupportedChannels ->
+                                    viewModel.ptzPopupMessage = "This camera has no PTZ."
+                                else -> ptzOpen = !ptzOpen
+                            }
                         }) {
                             Icon(Icons.Default.Gamepad,
                                 contentDescription = "PTZ",
@@ -156,7 +161,7 @@ fun LiveScreen(viewModel: NvrViewModel, channelId: Int, onBack: () -> Unit) {
                     }
                 } else {
                     key(r, forceTcp) {
-                        VlcRtspPlayer(rtspUrl = r, forceTcp = forceTcp)
+                        VlcRtspPlayer(rtspUrl = r, forceTcp = forceTcp, remote = remoteMode)
                     }
                 }
             }
@@ -180,6 +185,17 @@ fun LiveScreen(viewModel: NvrViewModel, channelId: Int, onBack: () -> Unit) {
                 }
             }
             Box(modifier = Modifier.fillMaxWidth().weight(1f))
+        }
+
+        viewModel.ptzPopupMessage?.let { msg ->
+            AlertDialog(
+                onDismissRequest = { viewModel.ptzPopupMessage = null; ptzOpen = false },
+                confirmButton = {
+                    TextButton(onClick = { viewModel.ptzPopupMessage = null; ptzOpen = false }) { Text("OK") }
+                },
+                title = { Text("PTZ unavailable") },
+                text = { Text(msg) },
+            )
         }
     }
 }
@@ -348,7 +364,7 @@ private fun PtzPadBtn(
 }
 
 @Composable
-private fun VlcRtspPlayer(rtspUrl: String, forceTcp: Boolean) {
+private fun VlcRtspPlayer(rtspUrl: String, forceTcp: Boolean, remote: Boolean = false) {
     val context = androidx.compose.ui.platform.LocalContext.current
     // retryEpoch flips when the user taps Retry — keys the libVlc + DisposableEffect
     // so the whole player is torn down + re-created from scratch.
@@ -367,7 +383,8 @@ private fun VlcRtspPlayer(rtspUrl: String, forceTcp: Boolean) {
             "--clock-jitter=0",
             "--clock-synchro=0",
             if (forceTcp) "--rtsp-tcp" else "--no-rtsp-tcp",
-            "-vvv",
+            // Verbose libVLC logging only in debug builds (release = quiet).
+            if (com.arcisai.nvr.BuildConfig.DEBUG) "-vvv" else "-q",
         )
         LibVLC(context, args)
     }
@@ -391,6 +408,12 @@ private fun VlcRtspPlayer(rtspUrl: String, forceTcp: Boolean) {
         player.attachViews(videoLayout, null, false, false)
 
         val media = Media(libVlc, android.net.Uri.parse(rtspUrl))
+        // HW decode enabled, NOT forced — auto-probe for both LAN and remote.
+        // (Forcing HW on remote was tried and reverted 2026-06-06: the cameras
+        // stream H.265/HEVC, and forced MediaCodec with no SW fallback surfaces
+        // "AMediaCodec.dequeueOutputBuffer failed" as a hard playback error under
+        // network jitter. Auto-probe lets VLC fall back. The robust live fix is to
+        // set the cameras to H.264, which Android HW-decodes far more reliably.)
         media.setHWDecoderEnabled(true, false)
         media.addOption(":network-caching=300")
         media.addOption(":live-caching=300")

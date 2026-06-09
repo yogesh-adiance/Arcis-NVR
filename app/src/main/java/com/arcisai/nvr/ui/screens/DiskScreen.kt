@@ -15,23 +15,21 @@ import androidx.compose.ui.unit.sp
 import com.arcisai.nvr.viewmodel.NvrViewModel
 
 /**
- * Users — read-only list of NVR accounts (/netsdk/User), rendered generically
- * from whatever the firmware returns (user name + group/authority). Add / edit
- * / delete are intentionally deferred: they mutate live NVR auth (risk of
- * locking out admin) and the AddUser/DelUser Parameter schema isn't verified
- * against this firmware yet. To change the admin password, use Settings →
- * Change password.
+ * Storage / Disk — read-only view of the NVR's HDD table (/netsdk/Stat).
+ * Renders whatever the firmware reports (capacity / free / status / record
+ * mode) generically, so it's correct on any firmware and works over LAN and
+ * the P2P tunnel alike. Format/overwrite-toggle actions are deferred.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun UsersScreen(vm: NvrViewModel, onBack: () -> Unit) {
-    LaunchedEffect(Unit) { vm.loadUsers() }
-    val cfg = vm.usersCfg
+fun DiskScreen(vm: NvrViewModel, onBack: () -> Unit) {
+    LaunchedEffect(Unit) { vm.loadDiskStat() }
+    val stat = vm.diskStat
     val snack = rememberSettingsSnackbar(vm.settingStatus)
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Users", fontWeight = FontWeight.SemiBold) },
+                title = { Text("Storage / Disk", fontWeight = FontWeight.SemiBold) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -43,30 +41,36 @@ fun UsersScreen(vm: NvrViewModel, onBack: () -> Unit) {
     ) { padding ->
         Column(modifier = Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState())) {
             SettingsStatusBar(vm.settingStatus)
-            if (cfg == null) {
+            if (stat == null) {
                 Box(Modifier.fillMaxWidth().padding(48.dp), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
                 return@Column
             }
 
-            Text("Accounts configured on the NVR. Read-only for now — use " +
-                "“Change password” to update the admin credential.",
+            Text("HDD status reported by the NVR.",
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                 fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
-            val users = firstArray(cfg)
-            if (users != null && users.length() > 0) {
-                for (i in 0 until users.length()) {
-                    val u = users.optJSONObject(i) ?: continue
-                    ElevatedCard(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
-                        JsonScalarRows(u)
+            // Top-level scalar fields (e.g. totals / record mode).
+            JsonScalarRows(stat)
+
+            // Per-disk cards from whichever array the firmware returns.
+            val disks = firstArray(stat)
+            if (disks != null && disks.length() > 0) {
+                for (i in 0 until disks.length()) {
+                    val d = disks.optJSONObject(i) ?: continue
+                    Spacer(Modifier.height(8.dp))
+                    ElevatedCard(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                        SectionLabel("Disk ${i + 1}")
+                        JsonScalarRows(d)
                         Spacer(Modifier.height(4.dp))
                     }
                 }
-            } else {
-                // Fall back to scalar fields if the firmware nests differently.
-                JsonScalarRows(cfg)
+            } else if (firstArray(stat) == null) {
+                Text("No disk array in the response — showing raw fields above.",
+                    modifier = Modifier.padding(16.dp), fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Spacer(Modifier.height(32.dp))
         }

@@ -87,8 +87,14 @@ dependencies {
     // Navigation
     implementation("androidx.navigation:navigation-compose:2.8.2")
 
-    // Networking — OkHttp w/ Basic auth
+    // Networking — OkHttp w/ Basic auth (NetSdkApi + publisher).
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Retrofit + Gson for the Arcis cloud backend (auth/login, abd/addAbd, abd/getAbd).
+    // HTTP-only cookie session — same shape the production ArcisAI-Android app uses.
+    implementation("com.squareup.retrofit2:retrofit:2.11.0")
+    implementation("com.squareup.retrofit2:converter-gson:2.11.0")
+    implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 
     // Encrypted creds storage
     implementation("androidx.security:security-crypto:1.1.0-alpha06")

@@ -10,6 +10,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Alarm
 import androidx.compose.material.icons.filled.CalendarToday
+import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Email
@@ -23,6 +24,7 @@ import androidx.compose.material.icons.filled.PersonOutline
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.SdStorage
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Wifi
@@ -45,7 +47,8 @@ private val SECTIONS = listOf(
         SettingsRow("encode", "Encoding",      "Resolution, bitrate, codec",         Icons.Default.Videocam),
         SettingsRow("color",  "Image / Color", "Brightness, contrast, rollover",     Icons.Default.Palette),
         SettingsRow("osd",    "OSD",           "Channel-name + time overlay",        Icons.Default.Tune),
-        SettingsRow("ptz",    "PTZ",           "Protocol, baud rate, address",       Icons.Default.MotionPhotosOn),
+        // PTZ config row intentionally omitted: IP cameras are driven via
+        // Protocol:Network (live PTZ pad), so there's no NVR-side PTZ config form.
     )),
     SettingsSection("Network", listOf(
         SettingsRow("network", "LAN",   "DHCP, IP, gateway, DNS, ports",     Icons.Default.Lan),
@@ -53,10 +56,10 @@ private val SECTIONS = listOf(
         SettingsRow("smtp",    "Email", "Outbound SMTP for alarms",          Icons.Default.Email),
         SettingsRow("pppoe",   "PPPoE", "DSL dial-up",                       Icons.Default.Language),
     )),
-    SettingsSection("Recording & alarms", listOf(
-        SettingsRow("event",    "Alarms / Events", "Motion, alarm-in / -out, video-loss", Icons.Default.Alarm),
-        SettingsRow("record",   "Record schedule", "Per-channel 7-day grid",              Icons.Default.Schedule),
-        SettingsRow("disk",     "Storage / Disk",  "HDD usage, format, overwrite",        Icons.Default.SdStorage),
+    SettingsSection("Storage", listOf(
+        // Alarms/Events and Record-schedule rows are deferred (they need 7-day
+        // grid UIs) — omitted here so they don't dead-tap in the demo.
+        SettingsRow("disk",     "Storage / Disk",  "HDD usage, status, overwrite",        Icons.Default.SdStorage),
     )),
     SettingsSection("Users & security", listOf(
         SettingsRow("users",     "Users",            "Add, delete, permissions", Icons.Default.PersonOutline),
@@ -76,12 +79,20 @@ private val SECTIONS = listOf(
 fun SettingsHubScreen(
     onPick: (String) -> Unit,
     onLogout: () -> Unit,
+    onSwitchNvr: (() -> Unit)? = null,
+    currentNvrName: String? = null,
+    accountEmail: String? = null,
 ) {
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Settings", fontWeight = FontWeight.SemiBold) },
                 actions = {
+                    if (onSwitchNvr != null) {
+                        IconButton(onClick = onSwitchNvr) {
+                            Icon(Icons.Default.SwapHoriz, contentDescription = "Switch NVR")
+                        }
+                    }
                     IconButton(onClick = onLogout) {
                         Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Logout")
                     }
@@ -93,6 +104,29 @@ fun SettingsHubScreen(
             modifier = Modifier.padding(padding).fillMaxSize(),
             contentPadding = PaddingValues(vertical = 8.dp),
         ) {
+            if (onSwitchNvr != null) {
+                item(key = "h-account") {
+                    Text(
+                        "ACCOUNT",
+                        modifier = Modifier.fillMaxWidth()
+                            .padding(start = 20.dp, end = 16.dp, top = 14.dp, bottom = 6.dp),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                item(key = "r-switch-nvr") {
+                    AccountRow(
+                        icon = Icons.Default.Cameraswitch,
+                        label = "Switch NVR",
+                        subtitle = listOfNotNull(
+                            currentNvrName?.takeIf { it.isNotBlank() }?.let { "Currently: $it" },
+                            accountEmail?.takeIf { it.isNotBlank() },
+                        ).joinToString(" • ").ifBlank { "Pick a different NVR from your account" },
+                        onClick = onSwitchNvr,
+                    )
+                }
+            }
             SECTIONS.forEach { section ->
                 item(key = "h-${section.title}") {
                     Text(
@@ -140,6 +174,47 @@ fun SettingsHubScreen(
                 }
             }
             item { Spacer(Modifier.height(24.dp)) }
+        }
+    }
+}
+
+@Composable
+private fun AccountRow(
+    icon: ImageVector,
+    label: String,
+    subtitle: String,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .clickable { onClick() },
+        tonalElevation = 1.dp,
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.primaryContainer),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(icon, contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer)
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(label, fontWeight = FontWeight.SemiBold)
+                Text(subtitle, fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Icon(Icons.Default.ChevronRight, contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }

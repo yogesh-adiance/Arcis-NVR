@@ -185,3 +185,40 @@ fun nvrBool(raw: String?): Boolean = raw == "True" || raw == "true"
 
 /** Helper: convert Boolean → NVR's "True" / "False" string. */
 fun nvrStrBool(b: Boolean): String = if (b) "True" else "False"
+
+// ---------------------------------------------------------------------------
+// Generic JSON renderers — used by the screens whose exact firmware schema we
+// don't hand-tune (Disk / Users / Logs / PPPoE). They render the NVR's actual
+// response, so they're correct regardless of the precise field set and work
+// identically over LAN and the P2P tunnel.
+// ---------------------------------------------------------------------------
+
+/** CamelCase / snake_case → spaced label, e.g. "WifiESSID" → "Wifi ESSID". */
+fun prettyKey(k: String): String =
+    k.replace(Regex("([a-z0-9])([A-Z])"), "$1 $2").replace('_', ' ').trim()
+
+/** True when the NVR string looks boolean ("True"/"False"). */
+fun isNvrBoolStr(v: Any?): Boolean = v is String && (v == "True" || v == "False")
+
+/** Render every scalar (string/number/bool) field of [obj] as a read-only
+ *  row. Nested objects/arrays are skipped (rendered separately as cards). */
+@Composable
+fun JsonScalarRows(obj: org.json.JSONObject) {
+    obj.keys().asSequence().toList().forEach { k ->
+        val v = obj.opt(k)
+        if (v != null && v !is org.json.JSONObject && v !is org.json.JSONArray) {
+            ReadOnlyRow(prettyKey(k), v.toString())
+        }
+    }
+}
+
+/** Find the primary list inside an NVR response (disk/user/log array),
+ *  trying common wrapper keys first, then any array value. */
+fun firstArray(root: org.json.JSONObject): org.json.JSONArray? {
+    listOf("Item", "Items", "List", "UserList", "Users", "fileList",
+           "LogList", "Result", "Data", "Disk", "DiskList").forEach { k ->
+        root.optJSONArray(k)?.let { return it }
+    }
+    root.keys().forEach { k -> root.optJSONArray(k)?.let { return it } }
+    return null
+}

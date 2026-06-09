@@ -92,6 +92,7 @@ class NetSdkApi(val creds: NvrCredentials) {
     // Setting > Video
     // ------------------------------------------------------------------
     suspend fun streamConfig(): String = get("/netsdk/Stream")
+    suspend fun setStream(body: JSONObject): String = put("/netsdk/Stream", body.toString())
     suspend fun streamColor(): String = get("/netsdk/Stream/Color")
     suspend fun setStreamColor(body: String): String = put("/netsdk/Stream/Color", body)
     suspend fun streamEncode(): JSONArray = getJsonArray("/netsdk/Stream/Encode")

@@ -9,9 +9,16 @@ import androidx.lifecycle.viewModelScope
 import com.arcisai.nvr.data.ChannelCache
 import com.arcisai.nvr.data.CredentialStore
 import com.arcisai.nvr.data.NvrCredentials
+import com.arcisai.nvr.net.AESEncryption
+import com.arcisai.nvr.net.AbdDto
+import com.arcisai.nvr.net.AddAbdRequest
+import com.arcisai.nvr.net.BackendApi
+import com.arcisai.nvr.net.GetAbdRequest
+import com.arcisai.nvr.net.LoginRequest
 import com.arcisai.nvr.net.NetSdkApi
 import com.arcisai.nvr.net.NetSdkException
 import com.arcisai.nvr.net.OnvifDiscovery
+import com.arcisai.nvr.net.OnvifResolver
 import com.arcisai.nvr.net.PublisherApi
 import com.arcisai.nvr.net.PtzClient
 import com.arcisai.nvr.net.RtspTlsProxy
@@ -21,6 +28,7 @@ import com.arcisai.nvr.p2p.RemoteSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
@@ -38,6 +46,8 @@ data class ChannelInfo(
 class NvrViewModel(app: Application) : AndroidViewModel(app) {
     private val store = CredentialStore(app)
     private val cache = ChannelCache(app)
+    // Lazy: created on first cloud login.
+    private val cloudApi: BackendApi by lazy { BackendApi.create(app) }
 
     var credentials by mutableStateOf<NvrCredentials?>(null)
         private set
@@ -47,6 +57,31 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     // Login screen state
     var loginStatus by mutableStateOf<String?>(null)
     var loginBusy by mutableStateOf(false)
+
+    // ---- Arcis cloud (Remote-mode account) state -------------------------
+    /** Whether the user has a usable cookie session against dev.arcisai.io. */
+    var accountSignedIn by mutableStateOf(false)
+        private set
+    /** Friendly name + email of the currently signed-in cloud user. */
+    var accountName  by mutableStateOf<String?>(null)
+        private set
+    var accountEmail by mutableStateOf<String?>(null)
+        private set
+    /** The list of ABDs (NVRs) the user owns, last-fetched. */
+    var myAbds by mutableStateOf<List<AbdDto>>(emptyList())
+        private set
+    var abdListLoading by mutableStateOf(false)
+        private set
+    var abdListError by mutableStateOf<String?>(null)
+        private set
+    /** deviceIds we've actually reached over P2P this app session. The cloud
+     *  backend's `status` is often stale ("offline" even when the NVR's P2P
+     *  provider is live), so the My-NVRs list also treats a device as online
+     *  if we've connected to it — i.e. "if it connects, it's online". */
+    var sessionOnlineIds by mutableStateOf<Set<String>>(emptySet())
+        private set
+    /** Status message shown on Login + My-NVRs screens (snackbar-style). */
+    var accountStatus by mutableStateOf<String?>(null)
 
     // Channels list (Home screen)
     var channels by mutableStateOf<List<ChannelInfo>>(emptyList())
@@ -97,11 +132,24 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
             val perChan = sessions.keys.filter { it.startsWith("${creds.deviceId}-") }
             for (k in perChan) sessions.remove(k)?.let { runCatching { it.close() } }
 
+            // Bail if the user logged out / switched NVR before we got here —
+            // otherwise we'd resurrect a P2P session the user just tore down
+            // (leaving it "active" on the signaling server and blocking re-login).
+            if (credentials?.deviceId != creds.deviceId) {
+                android.util.Log.i("NvrViewModel", "attemptReconnectMain: aborted — creds changed")
+                return
+            }
             val ns = RemoteSession(creds.deviceId, remoteConfig)
             val ok = ns.connect()
             if (!ok) {
                 ns.close()
                 android.util.Log.w("NvrViewModel", "attemptReconnectMain: connect() returned false")
+                return
+            }
+            // Re-check after the (slow) connect: logout may have happened during it.
+            if (credentials?.deviceId != creds.deviceId) {
+                android.util.Log.i("NvrViewModel", "attemptReconnectMain: discarding — logged out during connect")
+                ns.close()
                 return
             }
             sessions[creds.deviceId] = ns
@@ -118,12 +166,10 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     init {
-        // Auto-load any persisted creds. In Remote mode we lazy-connect the
-        // HTTP session in login().
-        store.load()?.let { creds ->
-            credentials = creds
-            if (!creds.remote) api = NetSdkApi(creds)
-        }
+        // NOTE: we deliberately do NOT restore persisted NVR creds into a
+        // logged-in state on cold start — the app must always open on the login
+        // page, never resume straight into the last screen. (A cloud account
+        // session can still resume to the NVR picker via resumeAccountSessionIfAny.)
         // Restore last-known channels + ipCamInfo from disk so the UI never
         // flashes "no cameras attached" while a fresh fetch is in flight.
         runCatching {
@@ -142,25 +188,44 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 if (creds.remote) {
-                    remoteStatus = "Opening P2P tunnel…"
-                    val session = RemoteSession(creds.deviceId, remoteConfig)
-                    val ok = session.connect()
-                    if (!ok) {
-                        remoteStatus = null
-                        loginStatus = "Could not reach NVR via P2P (signaling-server or ICE failed)"
-                        session.close()
-                        return@launch
+                    // Retry with back-off: right after a logout the device provider
+                    // can still hold the previous consumer for ~30–60 s and either
+                    // refuse the new ICE or let it connect but stall the first HTTP
+                    // probe. Closing + waiting + retrying rides over that window
+                    // (fixes the "re-login → stream won't start" case, K1).
+                    var connected = false
+                    var lastErr: String? = null
+                    for (attempt in 1..3) {
+                        remoteStatus = if (attempt == 1) "Opening P2P tunnel…"
+                                       else "Reconnecting P2P… ($attempt/3)"
+                        val session = RemoteSession(creds.deviceId, remoteConfig)
+                        if (!session.connect()) {
+                            session.close(); lastErr = "signaling/ICE failed"
+                        } else {
+                            try {
+                                val a = NetSdkApi(creds.copy(host = "127.0.0.1", port = session.localPort))
+                                a.network()  // sanity probe through the tunnel
+                                sessions[creds.deviceId] = session
+                                store.save(creds)
+                                credentials = creds
+                                api = a
+                                sessionOnlineIds = sessionOnlineIds + creds.deviceId
+                                remoteStatus = "Connected via P2P"
+                                loadOrdinary()
+                                onSuccess()
+                                connected = true
+                                break
+                            } catch (t: Throwable) {
+                                lastErr = t.message ?: "tunnel probe failed"
+                                session.close()  // free the consumer so the retry is clean
+                            }
+                        }
+                        if (attempt < 3) kotlinx.coroutines.delay(2500L * attempt)
                     }
-                    sessions[creds.deviceId] = session
-                    val tunnelCreds = creds.copy(host = "127.0.0.1", port = session.localPort)
-                    val a = NetSdkApi(tunnelCreds)
-                    a.network()  // sanity probe through the tunnel
-                    store.save(creds)
-                    credentials = creds
-                    api = a
-                    remoteStatus = "Connected via P2P"
-                    loadOrdinary()
-                    onSuccess()
+                    if (!connected) {
+                        remoteStatus = null
+                        loginStatus = "Could not reach NVR via P2P: ${lastErr ?: "timeout"}"
+                    }
                 } else {
                     val a = NetSdkApi(creds)
                     a.network()
@@ -179,6 +244,30 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun logout() {
+        releaseSelectedNvrLocal()
+
+        // Clear cloud session too (best-effort GET /auth/logout + drop cookie).
+        viewModelScope.launch {
+            runCatching { cloudApi.logout() }
+            BackendApi.cookieJarInstance?.clear()
+        }
+        accountSignedIn = false
+        accountName = null
+        accountEmail = null
+        myAbds = emptyList()
+        abdListError = null
+    }
+
+    /**
+     * Drop the currently-selected NVR (close P2P tunnels, forget creds,
+     * clear cached channel data) but keep the cloud account session so the
+     * UI can return to MyNvrsScreen and pick a different ABD.
+     */
+    fun releaseSelectedNvr() {
+        releaseSelectedNvrLocal()
+    }
+
+    private fun releaseSelectedNvrLocal() {
         sessions.values.forEach { runCatching { it.close() } }
         sessions.clear()
         tlsProxies.values.forEach { runCatching { it.close() } }
@@ -186,6 +275,8 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         publisherTunnel?.let { runCatching { it.close() } }
         publisherTunnel = null
         publisherApiInstance = null
+        replayTunnel?.let { runCatching { it.close() } }
+        replayTunnel = null
         store.clear()
         cache.clear()
         credentials = null
@@ -193,6 +284,146 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         channels = emptyList()
         ipCamInfo = null
         remoteStatus = null
+    }
+
+    // ---- Arcis cloud (Remote-mode account flow) --------------------------
+    /** Login against dev.arcisai.io. On success the HTTP-only `token` cookie
+     *  is auto-persisted by [PersistentCookieStore] so the session survives
+     *  app restart; `onSuccess` is called so the UI can route to MyNvrsScreen. */
+    fun accountLogin(email: String, password: String, onSuccess: () -> Unit) {
+        if (loginBusy) return
+        loginBusy = true
+        loginStatus = null
+        viewModelScope.launch {
+            try {
+                // Backend AES-CBC-decrypts the password with a shared key/IV
+                // (see AESEncryption + Arcis_Main_Backend/authController.js).
+                // Sending plaintext fails the length-24 sanity check inside
+                // decryptPassword and lands us on the "wrong password" branch.
+                val enc = AESEncryption.encrypt(password)
+                val resp = cloudApi.login(LoginRequest(email = email, password = enc))
+                if (!resp.success) {
+                    loginStatus = resp.data ?: resp.message ?: "Login failed"
+                    return@launch
+                }
+                accountSignedIn = true
+                accountName  = resp.name
+                accountEmail = resp.email ?: email
+                onSuccess()
+            } catch (t: Throwable) {
+                loginStatus = friendlyHttpError(t)
+            } finally {
+                loginBusy = false
+            }
+        }
+    }
+
+    /** Try to resume an existing cloud session by hitting /abd/getAbd with the
+     *  persisted cookie. If it succeeds, we know the cookie is still valid and
+     *  can skip the email/password form on app launch. */
+    fun resumeAccountSessionIfAny(onResumed: () -> Unit) {
+        viewModelScope.launch {
+            try {
+                val resp = cloudApi.getAbd()
+                if (resp.success) {
+                    accountSignedIn = true
+                    myAbds = resp.data
+                    onResumed()
+                }
+            } catch (_: Throwable) {
+                // No valid session — user has to log in again.
+            }
+        }
+    }
+
+    fun loadAbds() {
+        if (abdListLoading) return
+        abdListLoading = true
+        abdListError = null
+        viewModelScope.launch {
+            try {
+                val resp = cloudApi.getAbd()
+                if (!resp.success) {
+                    abdListError = resp.message ?: "Couldn't load NVR list"
+                    return@launch
+                }
+                myAbds = resp.data
+            } catch (t: Throwable) {
+                abdListError = friendlyHttpError(t)
+            } finally {
+                abdListLoading = false
+            }
+        }
+    }
+
+    /** POST /api/abd/addAbd. Backend validates against EMS so a bad deviceId
+     *  comes back as a 404 with a clear message. */
+    fun addAbd(name: String, deviceId: String, onResult: (ok: Boolean, msg: String) -> Unit) {
+        viewModelScope.launch {
+            try {
+                val resp = cloudApi.addAbd(AddAbdRequest(name = name.trim(), deviceId = deviceId.trim()))
+                if (resp.success) {
+                    loadAbds()
+                    onResult(true, resp.message ?: "NVR added")
+                } else {
+                    onResult(false, resp.message ?: "Failed to add NVR")
+                }
+            } catch (t: Throwable) {
+                onResult(false, friendlyHttpError(t))
+            }
+        }
+    }
+
+    /** User picked an ABD on the MyNvrsScreen — open the P2P tunnel to it and
+     *  jump into the main app. Re-uses the existing remote login path. */
+    fun selectAbd(abd: AbdDto, onSuccess: () -> Unit) {
+        val email = accountEmail ?: ""
+        val creds = NvrCredentials(
+            host = "",
+            port = 80,
+            username = "admin",   // NVR-local auth still admin/empty (publisher's basic gate)
+            password = "",
+            remote = true,
+            deviceId = abd.deviceId,
+            accountEmail = email,
+            accountName  = accountName ?: "",
+            accountAbdName = abd.name,
+        )
+        login(creds, onSuccess)
+    }
+
+    /**
+     * Surfaces the backend's actual error text instead of guessing from the
+     * HTTP status code. The Arcis backend mixes two field names — `data` on
+     * auth endpoints, `message` on ABD endpoints — so try both. Only fall back
+     * to a generic message when we genuinely can't read the body (network
+     * error, garbage response, etc).
+     */
+    private fun friendlyHttpError(t: Throwable): String {
+        if (t is retrofit2.HttpException) {
+            val body = runCatching { t.response()?.errorBody()?.string().orEmpty() }
+                .getOrDefault("")
+            if (body.isNotBlank()) {
+                val parsed = runCatching {
+                    val j = JSONObject(body)
+                    j.optString("message").ifBlank { j.optString("data") }
+                }.getOrNull()
+                if (!parsed.isNullOrBlank()) return parsed
+            }
+            return when (t.code()) {
+                401 -> "Session expired — please sign in again"
+                404 -> "Not found"
+                in 500..599 -> "Server error (${t.code()}) — try again later"
+                else -> "Request failed (${t.code()})"
+            }
+        }
+        val raw = t.message.orEmpty()
+        return when {
+            raw.contains("UnknownHostException") || raw.contains("ConnectException") ->
+                "Couldn't reach dev.arcisai.io — check internet"
+            raw.contains("SocketTimeoutException") -> "Connection timed out"
+            else -> raw.ifBlank { "Network error" }
+        }
     }
 
     // Per-channel TLS-strip proxies for cameras whose RTSP is TLS-only
@@ -292,10 +523,41 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         val routed = if (creds.remote) {
             val rtspPort = ensureChannelRtspTunnel(channelId) ?: return null
             rewriteUrlHost(resolved.url, "127.0.0.1", rtspPort)
-        } else resolved.url
+        } else {
+            // LAN: for ONVIF cameras whose RTSP is directly reachable, ask the
+            // camera itself (ONVIF GetStreamUri) for the correct path + creds
+            // instead of trusting the publisher's generic /ch0_<n>.264 template.
+            // Cameras only reachable via the NVR fall back to the publisher URL.
+            onvifDirectStreamUrl(channelId, stream) ?: resolved.url
+        }
 
         return maybeWrapTls(routed, channelId)
     }
+
+    /** LAN-only ONVIF self-resolution. Returns null (→ caller uses the publisher
+     *  URL) for non-ONVIF cams, missing IP, or cams whose RTSP isn't directly
+     *  reachable from the phone (e.g. cameras only reachable via the NVR relay). */
+    private suspend fun onvifDirectStreamUrl(channelId: Int, stream: Int): String? {
+        val entry = findIpCamEntry(channelId) ?: return null
+        if (!entry.optString("Protocolname").equals("ONVIF", ignoreCase = true)) return null
+        val ip = entry.optString("IPAddr").ifBlank { return null }
+        if (!tcpReachable(ip, 554, 1500)) return null
+        val url = OnvifResolver.resolveStreamUri(
+            ip = ip,
+            onvifPort = entry.optInt("Port", 80),
+            user = entry.optString("Username", "admin"),
+            pass = entry.optString("Password", ""),
+            wantSub = stream != 0,
+        )
+        if (url != null) android.util.Log.i("NvrViewModel", "ONVIF-resolved ch$channelId -> $url")
+        return url
+    }
+
+    private suspend fun tcpReachable(host: String, port: Int, timeoutMs: Int): Boolean =
+        withContext(Dispatchers.IO) {
+            try { java.net.Socket().use { it.connect(java.net.InetSocketAddress(host, port), timeoutMs) }; true }
+            catch (_: Throwable) { false }
+        }
 
     /** Open (or reuse) the per-channel RTSP libjuice tunnel. Returns its
      *  localhost port. Only valid in Remote mode. Mirrors the HTTP-tunnel
@@ -667,6 +929,137 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------
+    // Recording playback.
+    //
+    //  - Search: PUT /netsdk/R.SearchRecord with the firmware envelope
+    //    {DEV,VER,API,Parameter}. Channel + Type are arrays of capitalised
+    //    booleans ("True"/"False"); BeginTime/EndTime are "HH:MM:SS"; Date is
+    //    "YYYY-MM-DD" (verified against the NVR web UI bundle). Response items
+    //    carry TimeStart/TimeEnd as epoch SECONDS in the NVR's local wall clock
+    //    expressed as if UTC — format with ZoneOffset.UTC, never the device's
+    //    zone (see arcis-nvr-record-timestamps).
+    //  - Stream: ReplayPlayer over the :10000 replay protocol. LAN dials the
+    //    NVR directly; Remote opens a `<deviceId>-replay` libjuice tunnel
+    //    (mirrors the publisher tunnel). The device provider must register a
+    //    matching service forwarding to 127.0.0.1:10000.
+    // ------------------------------------------------------------------
+    data class RecordSegment(val channel: Int, val startSec: Long, val endSec: Long, val type: String)
+
+    var recordSegments by mutableStateOf<List<RecordSegment>?>(null)
+    var recordSearchBusy by mutableStateOf(false)
+    var recordSearchStatus by mutableStateOf<String?>(null)
+
+    /** Channel IDs the NVR currently has a live connection to (`/netsdk/Stat`
+     *  IPC[].Status == "Connect success"). Playback hides everything not in this
+     *  set — disconnected cameras and empty slots — so only connected cameras
+     *  can be picked. Null = not loaded yet. */
+    var connectedChannels by mutableStateOf<Set<Int>?>(null)
+        private set
+
+    fun loadConnectedChannels() {
+        val a = api ?: return
+        viewModelScope.launch {
+            try {
+                val ipc = a.stat().optJSONArray("IPC") ?: return@launch
+                val set = mutableSetOf<Int>()
+                for (i in 0 until ipc.length()) {
+                    val o = ipc.optJSONObject(i) ?: continue
+                    if (o.optString("Status").equals("Connect success", ignoreCase = true)) {
+                        set.add(o.optInt("ID", i))
+                    }
+                }
+                connectedChannels = set
+                android.util.Log.i("NvrViewModel", "connectedChannels=$set")
+            } catch (t: Throwable) {
+                android.util.Log.w("NvrViewModel", "loadConnectedChannels failed: ${t.message}")
+            }
+        }
+    }
+
+    /** Search one channel's recordings for the UTC day containing [dayUtcMillis]. */
+    fun searchRecordings(channelId: Int, dayUtcMillis: Long) {
+        val a = api ?: run { recordSearchStatus = "Not connected"; return }
+        recordSearchBusy = true
+        recordSearchStatus = null
+        recordSegments = null
+        viewModelScope.launch {
+            try {
+                val date = java.time.Instant.ofEpochMilli(dayUtcMillis)
+                    .atZone(java.time.ZoneOffset.UTC).toLocalDate().toString()
+                val channelMask = JSONArray()
+                for (i in 0 until maxChannels) channelMask.put(if (i == channelId) "True" else "False")
+                // EXACT format verified live vs firmware 3.6.6.20TestF (2026-06-06):
+                // Type = 4 booleans (Timing/Motion/Alarm/Manual); CurrentPage MUST be a
+                // STRING; Reload:"True" is required. Any deviation (5 types, int page,
+                // missing Reload) → {"RetCode":"-1","RetDetail":"Search Failed!"}.
+                // Response: {"Item":[{Channel,Type,TimeStart,TimeEnd(epoch sec),TotalSize,Disk,ID}]}.
+                val typeMask = JSONArray().apply { repeat(4) { put("True") } }
+                val param = JSONObject()
+                    .put("Channel", channelMask)
+                    .put("Type", typeMask)
+                    .put("Date", date)
+                    .put("BeginTime", "00:00:00")
+                    .put("EndTime", "23:59:59")
+                    .put("PageSize", 200)
+                    .put("CurrentPage", "1")
+                    .put("Reload", "True")
+                val resp = JSONObject(a.searchRecord(netsdkEnvelope("R.SearchRecord", param)))
+                val arr = findRecordArray(resp)
+                val out = ArrayList<RecordSegment>()
+                if (arr != null) for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val s = o.optLong("TimeStart", o.optLong("BeginTime", 0))
+                    val e = o.optLong("TimeEnd", o.optLong("EndTime", 0))
+                    if (s > 0 && e > s) out.add(
+                        RecordSegment(o.optInt("Channel", channelId), s, e, o.optString("Type")))
+                }
+                recordSegments = out
+                recordSearchStatus = if (out.isEmpty()) "No recordings for that day" else null
+                android.util.Log.i("NvrViewModel", "searchRecordings ch$channelId $date -> ${out.size} segments")
+            } catch (t: Throwable) {
+                recordSearchStatus = "Search failed: ${t.message}"
+                android.util.Log.w("NvrViewModel", "searchRecordings failed: ${t.message}")
+            } finally {
+                recordSearchBusy = false
+            }
+        }
+    }
+
+    private fun findRecordArray(root: JSONObject): JSONArray? {
+        listOf("fileList", "Item", "List", "RecordList", "Record", "Result", "Data").forEach { k ->
+            root.optJSONArray(k)?.let { return it }
+        }
+        root.optJSONObject("Parameter")?.optJSONArray("Item")?.let { return it }
+        root.keys().forEach { k -> root.optJSONArray(k)?.let { return it } }
+        return null
+    }
+
+    @Volatile private var replayTunnel: RemoteSession? = null
+
+    /** Resolve the host:port for the :10000 replay stream. LAN → (host, 10000);
+     *  Remote → opens (or reuses) the `<deviceId>-replay` libjuice tunnel and
+     *  returns ("127.0.0.1", localPort). Null if the tunnel can't be opened. */
+    suspend fun replayEndpoint(): Pair<String, Int>? {
+        val creds = credentials ?: return null
+        if (!creds.remote) return creds.host to 10000
+        val cur = replayTunnel
+        if (cur != null && cur.isAlive) return "127.0.0.1" to cur.localPort
+        cur?.let { runCatching { it.close() } }
+        replayTunnel = null
+        val sid = "${creds.deviceId}-replay"
+        android.util.Log.i("NvrViewModel", "opening replay tunnel $sid")
+        val ns = RemoteSession(sid, remoteConfig)
+        if (!ns.connect()) {
+            ns.close()
+            android.util.Log.w("NvrViewModel", "replay tunnel connect failed for $sid")
+            return null
+        }
+        replayTunnel = ns
+        android.util.Log.i("NvrViewModel", "replay tunnel ready: $sid -> 127.0.0.1:${ns.localPort}")
+        return "127.0.0.1" to ns.localPort
+    }
+
+    // ------------------------------------------------------------------
     // PTZ control — talks to camera HTTP directly.
     //
     //  - LAN mode:    PtzClient → camera-IP:80 (direct)
@@ -678,6 +1071,13 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     // PTZ press, cached for the session lifetime.
     // ------------------------------------------------------------------
     var ptzStatus by mutableStateOf<String?>(null)
+    /** When non-null, the Live screen shows a popup dialog (e.g. "This camera
+     *  has no PTZ."). The publisher is the source of truth for PTZ capability. */
+    var ptzPopupMessage by mutableStateOf<String?>(null)
+    /** Channels the publisher has reported as having no PTZ — so the PTZ button
+     *  shows the popup immediately instead of opening a dead control pad. */
+    var ptzUnsupportedChannels by mutableStateOf<Set<Int>>(emptySet())
+        private set
 
     /** UI-side PTZ capability descriptor for a channel. Doesn't do any
      *  network work — pure protocol-name heuristic to grey out the pad
@@ -717,7 +1117,20 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
             if (!r.ok) {
                 // Publisher returns "camera does not support PTZ (fixed-position model)"
                 // for bullet/fixed-dome and "PTZ not implemented for N1 cams" for N1.
-                ptzStatus = extractError(r.error) ?: "PTZ rejected"
+                val err = extractError(r.error) ?: "PTZ rejected"
+                // A fixed camera rejects PTZ in several ways: an explicit "does not
+                // support PTZ" / "not implemented" message, OR (ONVIF cams like CP
+                // Plus) a SOAP fault such as "InvalidArgVal". Treat all of these as
+                // "no PTZ" and show the clean popup instead of the raw fault text.
+                val noPtz = listOf("support", "not implemented", "fixed", "no ptz",
+                                   "fault", "invalidarg", "invalid arg", "not exist", "rejected")
+                    .any { err.contains(it, ignoreCase = true) }
+                if (noPtz) {
+                    ptzUnsupportedChannels = ptzUnsupportedChannels + channelId
+                    ptzPopupMessage = "This camera has no PTZ."
+                } else {
+                    ptzStatus = err
+                }
             }
         }
     }
@@ -760,9 +1173,14 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     var smtpCfg by mutableStateOf<JSONObject?>(null)
     var wifiCfg by mutableStateOf<JSONObject?>(null)
     var encodeCfg by mutableStateOf<JSONArray?>(null)
+    var osdCfg by mutableStateOf<JSONObject?>(null)
     var localTimeRaw by mutableStateOf<String?>(null)
     var generalTimeCfg by mutableStateOf<JSONObject?>(null)
     var generalMaintCfg by mutableStateOf<JSONObject?>(null)
+    var pppoeCfg by mutableStateOf<JSONObject?>(null)
+    var diskStat by mutableStateOf<JSONObject?>(null)
+    var usersCfg by mutableStateOf<JSONObject?>(null)
+    var logsCfg by mutableStateOf<JSONObject?>(null)
     var settingStatus by mutableStateOf<String?>(null)
 
     fun loadOrdinary() = launchBlock({ api?.deviceInfo() }) {
@@ -775,6 +1193,9 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     fun loadSmtp() = launchBlock({ api?.smtp() }) { smtpCfg = it }
     fun loadWifi() = launchBlock({ api?.wifi() }) { wifiCfg = it }
     fun loadEncode() = launchBlock({ api?.streamEncode() }) { encodeCfg = it }
+    // OSD edits the full /netsdk/Stream object (Title/OSD/Ircut/Encode/Color/Ptz)
+    // and round-trips it on save so untouched fields are preserved.
+    fun loadOsd() = launchBlock({ api?.streamConfig()?.let { JSONObject(it) } }) { osdCfg = it }
 
     fun saveGeneral(updated: JSONObject) =
         launchSave({ api?.setGeneral(updated) }, "General saved") { loadGeneral() }
@@ -786,6 +1207,8 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
         launchSave({ api?.setWifi(updated) }, "Wi-Fi saved") { loadWifi() }
     fun saveEncode(updated: JSONArray) =
         launchSave({ api?.setStreamEncode(updated) }, "Encoding saved") { loadEncode() }
+    fun saveOsd(updated: JSONObject) =
+        launchSave({ api?.setStream(updated) }, "OSD saved") { loadOsd() }
     fun rebootNvr() =
         launchSave({ api?.reboot() }, "Reboot sent") {}
     fun testSmtp() =
@@ -800,6 +1223,53 @@ class NvrViewModel(app: Application) : AndroidViewModel(app) {
     fun loadGeneralMaint() = launchBlock({ api?.generalMaintenance() }) { generalMaintCfg = it }
     fun saveGeneralMaint(updated: JSONObject) =
         launchSave({ api?.setGeneralMaintenance(updated) }, "Maintenance schedule saved") { loadGeneralMaint() }
+
+    // ---- PPPoE (DSL dial-up) ----------------------------------------------
+    // Same /netsdk/Network/* family as Wi-Fi/SMTP — bare-object round-trip,
+    // no {DEV,VER,API,Parameter} envelope (that envelope is only for the
+    // "API action" endpoints like LogSearch / AddUser / R.SearchRecord).
+    fun loadPppoe() = launchBlock({ api?.pppoe() }) { pppoeCfg = it }
+    fun savePppoe(updated: JSONObject) =
+        launchSave({ api?.setPppoe(updated) }, "PPPoE saved") { loadPppoe() }
+
+    // ---- Storage / Disk (read-only) ---------------------------------------
+    fun loadDiskStat() = launchBlock({ api?.stat() }) { diskStat = it }
+
+    // ---- Users (read-only list) -------------------------------------------
+    // GET /netsdk/User needs no body. Add/edit/delete are deferred: they
+    // mutate live NVR auth (risk of locking out admin mid-demo) and the
+    // AddUser Parameter schema isn't verified against this firmware yet.
+    fun loadUsers() = launchBlock({ api?.users()?.let { JSONObject(it) } }) { usersCfg = it }
+
+    // ---- Logs (read-only search) ------------------------------------------
+    // LogSearch is non-destructive. Body must be the firmware envelope
+    // {DEV,VER,API:"LogSearch",Parameter:{...}} (verified against the NVR web
+    // UI bundle). Type 0 = all log types; broad page so the demo shows data.
+    fun loadLogs() {
+        val a = api ?: run { settingStatus = "Not connected"; return }
+        settingStatus = "Loading logs…"
+        viewModelScope.launch {
+            try {
+                val param = JSONObject()
+                    .put("Type", 0)
+                    .put("PageSize", 50)
+                    .put("CurrentPage", 1)
+                logsCfg = JSONObject(a.logSearch(netsdkEnvelope("LogSearch", param)))
+                settingStatus = null
+            } catch (t: Throwable) {
+                settingStatus = "Log search failed: ${t.message}"
+            }
+        }
+    }
+
+    /** Wrap a Parameter object in the firmware's action envelope. Used by the
+     *  "API action" endpoints (LogSearch, R.SearchRecord, AddUser, …) which —
+     *  unlike the bare Network-config PUTs — expect this outer shape. */
+    private fun netsdkEnvelope(apiName: String, parameter: JSONObject): String =
+        JSONObject()
+            .put("DEV", "XVR").put("VER", "1.0")
+            .put("API", apiName).put("Parameter", parameter)
+            .toString()
 
     // ---- Change password ---------------------------------------------------
     /** Posts to /netsdk/SetPasswd. NVR firmware expects User/OldPasswd/NewPasswd. */
